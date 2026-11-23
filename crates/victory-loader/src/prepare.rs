@@ -35,7 +35,7 @@ impl PreparedImage {
 ///
 /// * `IMAGE_FILE_DLL` set, entry point cleared: the OS maps it like a DLL
 ///   and calls nothing;
-/// * import and bound-import directories cleared: we bind imports
+/// * import, bound-import and IAT directories cleared: we bind imports
 ///   ourselves, using `info.imports` from the original;
 /// * TLS callback pointer cleared: the OS still allocates static TLS for
 ///   the image, but callbacks only run when we call them (after binding);
@@ -64,7 +64,10 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
         dll_characteristics,
     )?;
 
-    for index in [dir::IMPORT, dir::BOUND_IMPORT] {
+    // IAT too: Windows 10's loader reads it even with no import directory and
+    // faults on the missing descriptor (Windows 11 skips it). We protect each
+    // slot ourselves when binding, so nothing needs it.
+    for index in [dir::IMPORT, dir::BOUND_IMPORT, dir::IAT] {
         if let Some(at) = layout::data_directory_offset(&bytes, index) {
             write_u32(&mut bytes, at, 0)?;
             write_u32(&mut bytes, at + 4, 0)?;
@@ -173,6 +176,12 @@ mod tests {
         assert!(patched.is_dll());
         assert_eq!(patched.entry_rva, 0);
         assert!(patched.imports.is_empty());
+        let iat = layout::data_directory_offset(&prepared.bytes, dir::IAT).unwrap();
+        assert_eq!(
+            layout::read_u32(&prepared.bytes, iat),
+            Some(0),
+            "IAT directory"
+        );
         assert_eq!(patched.dll_characteristics & dll_flags::FORCE_INTEGRITY, 0);
         if let Some(tls) = &patched.tls {
             assert_eq!(tls.callbacks_va, 0);

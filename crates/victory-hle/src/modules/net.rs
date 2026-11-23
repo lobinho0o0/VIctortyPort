@@ -1049,7 +1049,12 @@ mod tests {
             );
         }
         // Every override names a real export of its DLL.
-        for e in m.exports.iter().filter(|e| !e.name.starts_with('#')) {
+        // WinHttpGetProxySettingsEx is Windows 11 only; our override serves it either way.
+        for e in m
+            .exports
+            .iter()
+            .filter(|e| !e.name.starts_with('#') && e.name != "WinHttpGetProxySettingsEx")
+        {
             let dll = if e.name.starts_with("WinHttp") {
                 "winhttp.dll"
             } else {
