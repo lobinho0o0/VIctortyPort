@@ -1,0 +1,104 @@
+name: Bug report
+description: VIctory crashes, stops, or does not do what the console does.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        One problem in each report. Search the open issues first: if your crash has the same address (for example `+0x4e8aa70`), add a comment there.
+
+        Do not attach game files, dumps, extracted data or screenshots of the game. Text logs from VIctory are permitted. See `docs/asset-policy.md`.
+
+  - type: input
+    id: commit
+    attributes:
+      label: VIctory commit
+      description: Output of `git rev-parse --short HEAD`.
+      placeholder: 015d45b
+    validations:
+      required: true
+
+  - type: dropdown
+    id: profile
+    attributes:
+      label: Build
+      options:
+        - release
+        - diag (with the diagnostics feature)
+        - debug
+    validations:
+      required: true
+
+  - type: input
+    id: title-build
+    attributes:
+      label: Game build
+      description: The `build` line that `victory run` prints, and the package version.
+      placeholder: "build unknown (b99f876b…), package 1.0.2.1"
+    validations:
+      required: true
+
+  - type: input
+    id: cpu
+    attributes:
+      label: CPU
+      description: The full model. Some console instructions are on AMD CPUs only.
+      placeholder: AMD Ryzen 7 5800X
+    validations:
+      required: true
+
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU and driver version
+      placeholder: AMD RX 6700 XT, Adrenalin 25.9.1
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      description: Windows version and build number, or Wine/Proton version and distribution.
+      placeholder: Windows 11 24H2 (26100.4061)
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: What you did
+      description: The command you ran, environment variables you set, and the steps in the game.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: result
+    attributes:
+      label: What happened
+      description: What you saw, and what you expected.
+    validations:
+      required: true
+
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: |
+        The crash report from `crashes.log` (in the data folder, default `%LOCALAPPDATA%\victory\data`) or the last 50 lines of console output.
+      render: text
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Confirm
+      options:
+        - label: I searched the issues and found no report of this problem.
+          required: true
+        - label: My game files come from a copy of the game that I own.
+          required: true
+        - label: This report does not include game files or data taken from them.
+          required: true

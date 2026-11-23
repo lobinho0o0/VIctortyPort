@@ -1,0 +1,31 @@
+name: PR description
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      # The body comes from the event file, not from an expression in the
+      # script, so text in the body cannot run as a command.
+      - name: Check the template sections
+        run: |
+          jq -r '.pull_request.body // ""' "$GITHUB_EVENT_PATH" \
+            | tr -d '\r' \
+            | perl -0pe 's/<!--.*?-->//gs' > body.md
+          fail=0
+          for section in What Tested; do
+            text=$(awk -v s="$section" '
+              $0 ~ "^## " s "[[:space:]]*$" { on = 1; next }
+              /^## / { on = 0 }
+              on' body.md | tr -d '[:space:]')
+            if [ -z "$text" ]; then
+              echo "::error::The PR description has no text under \"## $section\". Use the template in .github/pull_request_template.md."
+              fail=1
+            fi
+          done
+          exit $fail
