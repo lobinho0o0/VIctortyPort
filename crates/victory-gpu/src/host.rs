@@ -299,6 +299,9 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
+    /// grown to the largest indirect execution recorded on the list.
+    indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -479,6 +482,7 @@ impl Host {
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
+                indirect_args: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -1058,6 +1062,20 @@ impl HostList {
             .push(Step::GpuWrite(shadow.clone(), address, len));
     }
 
+    /// Whether shaders of this list already wrote `buffer` (a title buffer's
+    /// host copy) through unordered access: implicit promotion has then left
+    /// it in `UNORDERED_ACCESS` until the submission ends, and it cannot be
+    /// promoted to a read state.
+    ///
+    /// shortcut: only writes declared through [`Self::defer_gpu_write`] are
+    /// seen; a buffer-state tracker should replace this.
+    pub(crate) fn gpu_written(&self, buffer: &ID3D12Resource) -> bool {
+        use windows::core::Interface;
+        self.deferred().copies.iter().any(|step| {
+            matches!(step, Step::GpuWrite(shadow, ..) if shadow.buffer.as_raw() == buffer.as_raw())
+        })
+    }
+
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
         self.deferred().writes.push((dst as usize, what, bytes));
@@ -1126,6 +1144,33 @@ impl HostList {
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
+    }
+
+    /// A device-local unordered-access buffer of at least `size` bytes for
+    /// clamped indirect arguments, reused across executions and resets of the
+    /// list. Smaller buffers replaced mid-list stay alive until
+    /// [`HostList::reset`].
+    pub(crate) fn indirect_scratch(&self, size: u64) -> Option<ID3D12Resource> {
+        let needed = size.max(64 << 10);
+        let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((buffer, cap)) = &*slot
+            && *cap >= needed
+        {
+            return Some(buffer.clone());
+        }
+        let prev = slot.as_ref().map_or(0, |(_, cap)| *cap);
+        let alloc = prev
+            .saturating_mul(2)
+            .max(needed)
+            .next_multiple_of(64 << 10);
+        let buffer = host()?.uav_buffer(alloc)?;
+        name(&buffer, || format!("indirect arguments {alloc:#x}"));
+        let old = slot.replace((buffer.clone(), alloc));
+        drop(slot);
+        if let Some((old_buf, _)) = old {
+            self.keep(&old_buf);
+        }
+        Some(buffer)
     }
 
     /// Keeps `object` alive until the list is reset.
@@ -1799,6 +1844,48 @@ impl Host {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
                 tracing::warn!(error = %e, size, "no shared buffer");
+                None
+            }
+        }
+    }
+
+    /// A device-local buffer shaders may write (unordered access) and indirect
+    /// execution may read, starting in the common state.
+    pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a device-local buffer.
+        let made = unsafe {
+            self.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut buffer,
+            )
+        };
+        match made {
+            Ok(()) => buffer,
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no unordered-access buffer");
                 None
             }
         }
