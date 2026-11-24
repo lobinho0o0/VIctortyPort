@@ -478,9 +478,45 @@ pub(crate) struct CopyLocation {
     footprint: crate::resource::PlacedFootprint,
 }
 
-/// Texture to texture on the GPU; buffer to texture through an upload
-/// buffer filled at submission. Texture to buffer (read back) is not done
-/// yet.
+/// Size of the source box, or of the selected mip/array/plane subresource
+/// when the caller asks D3D12 to copy the whole subresource.
+#[cfg(windows)]
+fn readback_extent(
+    host: &crate::host::Host,
+    texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    subresource: u32,
+    source_box: Option<&[u32; 6]>,
+) -> Option<[u32; 3]> {
+    if let Some(&[left, top, front, right, bottom, back]) = source_box {
+        return Some([
+            right.checked_sub(left)?,
+            bottom.checked_sub(top)?,
+            back.checked_sub(front)?,
+        ]);
+    }
+    use windows::Win32::Graphics::Direct3D12::D3D12_PLACED_SUBRESOURCE_FOOTPRINT;
+    let mut layout = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+    let mut total = 0;
+    // SAFETY: the texture is live and both outputs hold one subresource's result.
+    unsafe {
+        host.device.GetCopyableFootprints(
+            &texture.GetDesc(),
+            subresource,
+            1,
+            0,
+            Some(&mut layout),
+            None,
+            None,
+            Some(&mut total),
+        );
+    }
+    let fp = layout.Footprint;
+    (total != u64::MAX).then_some([fp.Width, fp.Height, fp.Depth])
+}
+
+/// Texture to texture on the GPU, buffer to texture through an upload
+/// buffer filled at submission, and texture to buffer through a readback
+/// buffer copied into title memory once the submission completes.
 extern "system" fn copy_texture_region(
     this: This,
     dst: *const CopyLocation,
@@ -503,9 +539,155 @@ extern "system" fn copy_texture_region(
         else {
             return;
         };
+        const _: () =
+            assert!(size_of::<CopyLocation>() == size_of::<D3D12_TEXTURE_COPY_LOCATION>());
+        let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
+        if dst.kind == FOOTPRINT {
+            if src.kind == FOOTPRINT {
+                return;
+            }
+            let (Some(host), Some(from_tex)) = (
+                crate::host::host(),
+                crate::resource::host_resource(src.resource),
+            ) else {
+                return;
+            };
+            let Some((lines, row_bytes, total)) = dst.footprint.layout() else {
+                return;
+            };
+            let host_format = crate::resource::pc_format(dst.footprint.format);
+            if crate::resource::element(host_format)
+                != crate::resource::element(dst.footprint.format)
+            {
+                // Console formats such as 118..=120 (3-byte D16S8) map to
+                // 4-byte PC substitutes (45..=47): raw readback would mis-size
+                // the staging buffer and write the wrong texel layout.
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::warn!(
+                        format = dst.footprint.format,
+                        host_format,
+                        "texture-to-buffer readback skipped: host format has a different texel size",
+                    );
+                });
+                return;
+            }
+            if total == 0 || lines == 0 || row_bytes == 0 {
+                return;
+            }
+            // For a subresource location the first DWORD of the footprint union is its index.
+            let Some([width, height, depth]) = readback_extent(
+                host,
+                from_tex,
+                src.footprint.offset as u32,
+                // SAFETY: the optional source box is read during this call.
+                unsafe { source_box.as_ref() },
+            ) else {
+                return;
+            };
+            let footprint = dst.footprint;
+            let Some((element, block)) = crate::resource::element(footprint.format) else {
+                return;
+            };
+            // A BC mip's reported extent can include its final partial block.
+            // Measure the footprint and the copied area in the same storage units.
+            let rows_per_slice = u64::from(footprint.height).div_ceil(block);
+            let row_in_slice = u64::from(y) / block;
+            let first_row = u64::from(z) * rows_per_slice + row_in_slice;
+            let column_bytes = (u64::from(x) / block) * element;
+            let copy_rows = u64::from(height).div_ceil(block);
+            let copy_bytes = u64::from(width).div_ceil(block) * element;
+            if copy_bytes == 0
+                || copy_rows == 0
+                || depth == 0
+                || column_bytes + copy_bytes > row_bytes
+                || row_in_slice + copy_rows > rows_per_slice
+                || u64::from(z) + u64::from(depth) > u64::from(footprint.depth)
+            {
+                return;
+            }
+            let dst_pitch = u64::from(dst.footprint.row_pitch);
+            if lines > 1 && dst_pitch < row_bytes {
+                return;
+            }
+            let Some(target) = buffer_range(dst.resource, dst.footprint.offset, total) else {
+                return;
+            };
+            let Ok(row_bytes_u32) = u32::try_from(row_bytes) else {
+                return;
+            };
+            // D3D12 requires placed footprints' row pitch to be 256-byte aligned.
+            let Some(host_pitch) = dst
+                .footprint
+                .row_pitch
+                .max(row_bytes_u32)
+                .checked_next_multiple_of(256)
+            else {
+                return;
+            };
+            let Some(staging_bytes) = u64::from(host_pitch)
+                .checked_mul(lines - 1)
+                .and_then(|n| n.checked_add(row_bytes))
+            else {
+                return;
+            };
+            let Some((buffer, staging)) = list.readback(host, staging_bytes) else {
+                return;
+            };
+            crate::texture::upload(list, src.resource, from_tex);
+            ensure_state(list, src.resource, COPY_SOURCE);
+            let mut to_location = dst;
+            to_location.resource = buffer.as_raw().cast_const().cast();
+            to_location.footprint.offset = 0;
+            to_location.footprint.format = host_format;
+            to_location.footprint.row_pitch = host_pitch;
+            let mut from_location = src;
+            from_location.resource = from_tex.as_raw().cast_const().cast();
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| {
+                // SAFETY: a live texture; the box is the title's or null.
+                let (d, b) = unsafe { (from_tex.GetDesc(), host_box.map(|b| *b)) };
+                format!(
+                    "readback to {:?} footprint {:?} at {x},{y},{z} from {:?} {}x{} f{} sub {} box {b:?}",
+                    dst.resource,
+                    dst.footprint,
+                    src.resource,
+                    d.Width,
+                    d.Height,
+                    d.Format.0,
+                    src.kind,
+                )
+            });
+            // SAFETY: an open list; both locations in the host's layout, naming
+            // live resources; the box is the title's (same layout).
+            unsafe {
+                list.list.CopyTextureRegion(
+                    (&raw const to_location).cast(),
+                    x,
+                    y,
+                    z,
+                    (&raw const from_location).cast(),
+                    host_box,
+                )
+            };
+            // The GPU only populated the copied rectangle in staging. Preserve
+            // the rest of each destination row and the gaps between slices.
+            for slice in 0..u64::from(depth) {
+                let row = first_row + slice * rows_per_slice;
+                let dst_offset = (row * dst_pitch + column_bytes) as usize;
+                let src_offset = (row * u64::from(host_pitch) + column_bytes) as usize;
+                list.defer_readback(
+                    target.wrapping_add(dst_offset),
+                    staging.wrapping_add(src_offset),
+                    dst_pitch as usize,
+                    host_pitch as usize,
+                    copy_rows as usize,
+                    copy_bytes as usize,
+                );
+            }
+            return;
+        }
         let Some(to) = crate::resource::host_resource(dst.resource) else {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!("texture to buffer copies not implemented"));
             return;
         };
         let mut from = src;
@@ -542,7 +724,6 @@ extern "system" fn copy_texture_region(
         crate::texture::host_written(dst.resource);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
-        let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
         #[cfg(feature = "diagnostics")]
         {
             let text = || {
@@ -565,8 +746,6 @@ extern "system" fn copy_texture_region(
                 None => list.note_op(text),
             }
         }
-        const _: () =
-            assert!(size_of::<CopyLocation>() == size_of::<D3D12_TEXTURE_COPY_LOCATION>());
         // SAFETY: an open list; both locations in the host's layout, naming
         // live resources; the box is the title's (same layout).
         unsafe {
