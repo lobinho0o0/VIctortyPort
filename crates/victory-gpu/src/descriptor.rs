@@ -681,6 +681,7 @@ mod tests {
     #[cfg(all(windows, feature = "diagnostics"))]
     #[test]
     fn translated_shader_reads_root_indexed_buffer_from_fresh_table() {
+        use crate::pipeline::{Translated, compute_for_test};
         use victory_shader::native::{ComputeIo, StageIo};
         use victory_shader::{
             Container, HwStage, NativeProgram, ResourceType, RootParam, RootType, UsedResource,
@@ -768,25 +769,23 @@ mod tests {
         if std::env::var_os("VICTORY_D3D12_DEBUG").is_some() {
             device.device.cast::<ID3D12InfoQueue>().expect("D3D12 debug queue");
         }
-        let compile = victory_shader::emit::host::Host {
-            device: device.device.clone(),
-        };
-        let (root, pso) = compile
-            .compute_pipeline(&shader)
-            .expect("readback pipeline");
-        // SAFETY: create a shader-visible sampler heap for the root
-        // signature's directly indexed sampler flag. The shader never reads it.
-        let sampler_heap: ID3D12DescriptorHeap = unsafe {
-            device
-                .device
-                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
-                    NumDescriptors: 1,
-                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-                    NodeMask: 0,
-                })
-        }
-        .unwrap();
+        let mut samplers = std::ptr::null();
+        assert_eq!(
+            create(
+                HeapDesc {
+                    kind: SAMPLERS,
+                    count: 1,
+                    flags: 1,
+                    nodes: 0,
+                },
+                Placement {
+                    address: 0,
+                    size: 0,
+                },
+                &mut samplers,
+            ),
+            S_OK
+        );
         let mut this = std::ptr::null();
         let desc = HeapDesc {
             kind: 0,
@@ -854,41 +853,33 @@ mod tests {
             // the later index. Inspect it without dispatching an invalid read.
             assert!(!host.retains_resource(static_only[0].1 / 32 + 2));
         }
+        let pipeline = compute_for_test(Translated {
+            host: shader,
+            used: native.used,
+        });
+        let translated = pipeline.stages[0].translated();
         let mut readback = Vec::new();
         for selector in 0..=1 {
             let list = device.new_list().unwrap();
             let mut state = crate::draw::State::default();
-            state.set_heaps(&[this]);
+            state.set_heaps(&[this, samplers]);
             state.set_table(true, 0, heap.start + 32);
             state.set_table(true, 2, heap.start + 160);
             state.set_constants(true, 1, &[selector], 0);
-            let made = state.tables(&list, &native.used, &shader.root_indexed_views, true);
+            // Exercise production binding on both a new table and a
+            // cache hit, and check that the selected slot holds a buffer.
+            if selector == 0 {
+                state.bind(&list, &pipeline, true);
+            }
+            let made =
+                state.tables(&list, &translated.used, &translated.host.root_indexed_views, true);
             assert_eq!(made.len(), 1);
             assert!(host.retains_resource(made[0].1 / 32 + 1 + selector));
-            let mut words = vec![0; shader.user_data_dwords() as usize];
-            for user in &shader.user_data {
-                words[user.index as usize] = match user.slot {
-                    0 => made[0].1,
-                    1 => selector,
-                    2 => 160,
-                    _ => panic!("unexpected root slot {}", user.slot),
-                };
+            if selector == 1 {
+                state.bind(&list, &pipeline, true);
             }
-            // SAFETY: all bindings and their backing resources live through
-            // this submission. The GPU reads the actual slot map and heap.
-            unsafe {
-                list.list
-                    .SetDescriptorHeaps(&[Some(host.heap.clone()), Some(sampler_heap.clone())]);
-                list.list.SetComputeRootSignature(&root);
-                list.list.SetPipelineState(&pso);
-                list.list.SetComputeRoot32BitConstants(
-                    0,
-                    words.len() as u32,
-                    words.as_ptr().cast(),
-                    0,
-                );
-                list.list.Dispatch(1, 1, 1);
-            }
+            // SAFETY: an open list with its compute state bound.
+            unsafe { list.list.Dispatch(1, 1, 1) };
             list.close();
             assert_eq!(device.log_messages(), None);
             device.execute(&[&list]);
@@ -896,6 +887,7 @@ mod tests {
             readback.push(unsafe { (bases[3] as *const u32).read_volatile() });
         }
         release(this);
+        release(samplers);
         for address in bases {
             crate::shadow::unregister(address as usize, address);
         }

@@ -100,6 +100,17 @@ pub(crate) struct Translated {
     pub(crate) used: Vec<victory_shader::UsedResource>,
 }
 
+#[cfg(all(test, windows, feature = "diagnostics"))]
+pub(crate) fn compute_for_test(translated: Translated) -> host::HostPipeline {
+    let shader = Arc::new(Shader {
+        stage: "compute",
+        hash: "synthetic readback".into(),
+        container: Vec::new(),
+        translated: OnceLock::from(Some(translated)),
+    });
+    host::HostPipeline::new(&[shader], None).expect("readback pipeline")
+}
+
 #[cfg(windows)]
 impl Shader {
     /// The translation, made on first use; a shader that does not
