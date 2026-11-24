@@ -8,6 +8,9 @@ the platform underneath it and converts the title's data, ahead of time where
 it can and on first use where it must (shaders). See
 [docs/architecture.md](docs/architecture.md).
 
+The Windows executable can also be launched under Proton on x86-64 Linux. See
+[Running with the Proton launcher](docs/proton-launcher.md).
+
 ## Status (2026-11-23)
 
 **Not playable yet.** The title boots, runs its menus at its own 30 fps and

@@ -1,2 +1,6 @@
 [alias]
 xtask = "run --quiet --package xtask --"
+
+[target.x86_64-pc-windows-gnullvm]
+# Link LLVM-MinGW's unwinder into the executable for a clean Proton prefix.
+rustflags = ["-C", "target-feature=+crt-static"]

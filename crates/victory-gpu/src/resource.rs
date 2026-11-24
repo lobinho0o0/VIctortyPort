@@ -1592,7 +1592,8 @@ mod tests {
     fn buffer_data_reaches_the_host_texture() {
         use windows::Win32::Graphics::Direct3D12::*;
         let Some(host) = crate::host::host() else {
-            return; // no host GPU here
+            eprintln!("Skipping texture readback: no usable host D3D12 device");
+            return;
         };
         let null = std::ptr::null();
         let iid = &RESOURCE_IIDS[0];

@@ -22,6 +22,10 @@ fn workspace_root() -> PathBuf {
 /// Builds the fixture into its own target dir (the outer cargo holds the
 /// lock on the main one while tests run).
 fn build_probe() -> PathBuf {
+    // Under Proton the Windows test process cannot invoke the Linux Cargo.
+    if let Some(path) = std::env::var_os("VICTORY_HLE_PROBE") {
+        return PathBuf::from(path);
+    }
     let root = workspace_root();
     let manifest = root.join("tests/fixtures/hle-probe/Cargo.toml");
     let target = root.join("target/fixtures");
