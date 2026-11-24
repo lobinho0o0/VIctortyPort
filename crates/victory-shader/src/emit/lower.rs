@@ -4005,6 +4005,36 @@ impl<'a> Lower<'a> {
                 );
                 int(self, r)
             }
+            "v_swap_b32" => {
+                if v.abs != 0
+                    || v.neg != 0
+                    || v.clamp
+                    || v.omod != 0
+                    || v.sdwa.is_some()
+                    || v.dpp.is_some()
+                {
+                    return Err("modifiers on v_swap_b32");
+                }
+                let Some(Operand::Vector { reg: dst, .. }) = v.dst else {
+                    return Err("v_swap_b32 outside a VGPR");
+                };
+                let Some(&Operand::Vector { reg: src, .. }) = v.src.first() else {
+                    return Err("v_swap_b32 from a non-VGPR");
+                };
+                let read_vgpr = |l: &mut Self, r: u8| -> Result<V, Why> {
+                    match inst.read(Reg::V(r)) {
+                        Some(o) => l.i32_of(o),
+                        None => Ok(l.s.m.i32(0)),
+                    }
+                };
+                let old_dst = read_vgpr(self, dst)?;
+                let old_src = read_vgpr(self, src)?;
+                self.write(inst, Reg::V(dst), old_src, guard);
+                if dst != src {
+                    self.write(inst, Reg::V(src), old_dst, guard);
+                }
+                Ok(())
+            }
             _ => {
                 let r = self.integer(inst, name)?;
                 int(self, r)
@@ -4589,6 +4619,12 @@ impl<'a> Lower<'a> {
                 let a = s(self, 0)?;
                 let ones = k(self, u32::MAX);
                 self.s.m.bin(c, Bin::Xor, a, ones)
+            }
+            "v_xnor_b32" => {
+                let (a, b) = (s(self, 0)?, s(self, 1)?);
+                let x = self.s.m.bin(c, Bin::Xor, a, b);
+                let ones = k(self, u32::MAX);
+                self.s.m.bin(c, Bin::Xor, x, ones)
             }
             "v_lshlrev_b32" | "v_lshrrev_b32" | "v_ashrrev_i32" => {
                 let (sh, a) = (s(self, 0)?, s(self, 1)?);
@@ -6649,5 +6685,55 @@ mod tests {
         assert_eq!(buffer_format(0), None);
         assert_eq!(buffer_format(36), None);
         assert_eq!(buffer_format(78), None);
+    }
+
+    #[test]
+    fn v_xnor_b32_and_v_swap_b32_translate() {
+        use crate::{
+            HwStage,
+            dxbc::Container,
+            io, ir,
+            native::{ComputeIo, NativeProgram, StageIo},
+            resource, structure,
+        };
+        let words: [u32; 6] = [
+            0x7e00_0280, // v_mov_b32 v0, 0
+            0x7e02_0281, // v_mov_b32 v1, 1
+            0x3c00_0101, // v_xnor_b32 v0, v1, v0
+            0x7e00_cb01, // v_swap_b32 v0, v1
+            0x7e00_cb00, // v_swap_b32 v0, v0
+            0xbf81_0000, // s_endpgm
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 2,
+            layout: Vec::new(),
+            used: Vec::new(),
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 0,
+                threads: [1, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let container = Container {
+            digest: [0; 16],
+            version: (1, 0),
+            parts: Vec::new(),
+        };
+        let out = super::super::emit(&container, &native, &p, &st, &io, &res).unwrap();
+        assert_eq!(out.stage, HwStage::Cs);
+        assert!(!out.dxil.is_empty());
+        #[cfg(windows)]
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut out.dxil.clone()).unwrap();
+        }
     }
 }
