@@ -13,7 +13,7 @@
 //! (`ComputeSurfaceInfoMacroTiled`, `ComputeThinBlockDimension`,
 //! `GetMipTailDim`, `GetMaxNumMipsInTail`, `HwlComputeSurfaceInfoLinear`,
 //! `ComputeSurfaceAddrFromCoordMacroTiled`), and the 256-byte micro tile
-//! patterns in [`MICRO`] from `gfx10SwizzlePattern.h` (the RB+ tables, as on
+//! patterns in `MICRO` from `gfx10SwizzlePattern.h` (the RB+ tables, as on
 //! RDNA2). addrlib carries this notice:
 //!
 //! Copyright (C) 2007-2026 Advanced Micro Devices, Inc. All rights reserved.
@@ -701,8 +701,10 @@ pub struct Format {
     pub stencil: bool,
 }
 
-/// By DXGI format number. `None` for 96-bit, 1-bit, packed 4:2:2 and video
-/// formats.
+/// By DXGI format number, with the console's own numbers: 116/117 (10-bit
+/// float color), 118-120 (16-bit depth with 8-bit stencil), 189
+/// (R10G10B10_SNORM_A2_UNORM) and 190 (R4G4_UNORM). `None` for 96-bit,
+/// 1-bit, packed 4:2:2 and video formats.
 ///
 /// shortcut: those formats have no layout here; add them when a title uses
 /// one.
@@ -711,10 +713,10 @@ pub fn format(dxgi: u32) -> Option<Format> {
         1..=4 => (16, 1, false),
         9..=18 => (8, 1, false),
         19..=22 | 44..=47 => (4, 1, true),
-        23..=43 | 67 | 87..=93 | 116 | 117 => (4, 1, false),
+        23..=43 | 67 | 87..=93 | 116 | 117 | 189 => (4, 1, false),
         48..=59 | 85 | 86 | 115 => (2, 1, false),
         118..=120 => (2, 1, true),
-        60..=65 => (1, 1, false),
+        60..=65 | 190 => (1, 1, false),
         70..=72 | 79..=81 => (8, 4, false),
         73..=78 | 82..=84 | 94..=99 => (16, 4, false),
         _ => return None,
@@ -1010,6 +1012,101 @@ mod tests {
         assert!(!t.planes[0].layout.addressable());
     }
 
+    /// The console's own format numbers have element sizes, so their
+    /// textures get a console layout like any other.
+    #[test]
+    fn console_formats_have_layouts() {
+        let element = |bytes, stencil| {
+            Some(Format {
+                bytes,
+                block: 1,
+                stencil,
+            })
+        };
+        for (dxgi, want) in [
+            // R10G10B10_7E3_A2_FLOAT, R10G10B10_6E4_A2_FLOAT.
+            (116, element(4, false)),
+            (117, element(4, false)),
+            // D16_UNORM_S8_UINT and its typeless views: 16-bit depth, then
+            // a stencil plane.
+            (118, element(2, true)),
+            (119, element(2, true)),
+            (120, element(2, true)),
+            // R10G10B10_SNORM_A2_UNORM, R4G4_UNORM.
+            (189, element(4, false)),
+            (190, element(1, false)),
+        ] {
+            assert_eq!(format(dxgi), want, "format {dxgi}");
+            let t = Texture::new(&TextureDesc {
+                dimension: Dimension::Tex2d,
+                width: 256,
+                height: 256,
+                depth_or_array: 1,
+                mips: 0,
+                format: dxgi,
+                samples: 1,
+                swizzle: Swizzle::SW_64KB_R_X,
+            })
+            .unwrap_or_else(|e| panic!("format {dxgi}: {e:?}"));
+            assert_eq!(t.planes[0].layout.desc.element_bytes, want.unwrap().bytes);
+        }
+        // Video and 1-bit formats still have none.
+        for dxgi in [66, 103, 130] {
+            assert_eq!(format(dxgi), None, "format {dxgi}");
+        }
+    }
+
+    /// `mips: 0` asks for the full chain, down to one texel on the largest
+    /// side: the array size does not count, a 3D texture's depth does, and
+    /// block-compressed formats count texels, not 4x4 blocks. A depth format
+    /// gives its stencil plane the same chain.
+    #[test]
+    fn a_zero_mip_count_is_the_full_chain() {
+        use Dimension::*;
+        // R8G8B8A8_UNORM, BC1_UNORM, D32_FLOAT_S8X24_UINT.
+        let (rgba8, bc1, d32s8) = (28, 71, 20);
+        for (dimension, width, height, depth_or_array, dxgi, swizzle, want) in [
+            (Tex2d, 1, 1, 1, rgba8, Swizzle::SW_64KB_S, 1),
+            (Tex2d, 256, 256, 1, rgba8, Swizzle::SW_64KB_S, 9),
+            (Tex2d, 257, 3, 1, rgba8, Swizzle::SW_4KB_S, 9),
+            (Tex2d, 3, 1000, 1, rgba8, Swizzle::LINEAR, 10),
+            (Tex2d, 4, 4, 1024, rgba8, Swizzle::SW_4KB_S, 3),
+            (Tex1d, 4096, 1, 64, rgba8, Swizzle::LINEAR, 13),
+            (Tex3d, 64, 64, 128, rgba8, Swizzle::SW_64KB_S, 8),
+            (Tex3d, 8, 8, 1, rgba8, Swizzle::SW_4KB_S, 4),
+            (Tex2d, 16, 16, 1, bc1, Swizzle::SW_64KB_S, 5),
+            (Tex2d, 1920, 1080, 6, bc1, Swizzle::SW_64KB_S, 11),
+            (Tex2d, MAX_EXTENT, 1, 1, rgba8, Swizzle::SW_64KB_S, 15),
+            (Tex2d, 512, 512, 1, d32s8, Swizzle::SW_64KB_Z_X, 10),
+        ] {
+            let t = Texture::new(&TextureDesc {
+                dimension,
+                width,
+                height,
+                depth_or_array,
+                mips: 0,
+                format: dxgi,
+                samples: 1,
+                swizzle,
+            })
+            .unwrap_or_else(|e| panic!("{width}x{height}x{depth_or_array}: {e:?}"));
+            for plane in &t.planes {
+                let mips = &plane.layout.mips;
+                let what = format!("{width}x{height}x{depth_or_array} format {dxgi}");
+                assert_eq!(mips.len(), want, "{what}");
+                // The last mip is one element (one texel, or the block that
+                // holds it) on every side.
+                let last = mips[want - 1];
+                assert_eq!((last.width, last.height), (1, 1), "{what}");
+                if dimension == Tex3d {
+                    assert_eq!(last.depth, 1, "{what}");
+                }
+            }
+            let stencil = format(dxgi).unwrap().stencil;
+            assert_eq!(t.planes.len(), 1 + usize::from(stencil));
+        }
+    }
+
     #[test]
     fn texture_copies_reject_overflowing_pitches() {
         let layout = Layout::new(&desc(4, 2, 1, 4, Swizzle::LINEAR)).unwrap();
@@ -1062,5 +1159,105 @@ mod tests {
             Err(Error::TooSmall)
         );
         assert_eq!(l.offset(0, 64, 0, 0), Err(Error::Invalid));
+    }
+
+    /// Random descriptions, coordinates and copy pitches give layouts or
+    /// errors, never a panic or an overflow; every layout and copy stays
+    /// inside the buffers it is given.
+    #[test]
+    fn noise_never_panics() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let dimensions = [Dimension::Tex1d, Dimension::Tex2d, Dimension::Tex3d];
+        for _ in 0..3000 {
+            // Mostly small sizes so copies are cheap, sometimes anything.
+            let mut extent = |small: u64| match next() % 8 {
+                0 => next() as u32,
+                1 => MAX_EXTENT + (next() % 3) as u32 - 1,
+                _ => (next() % small) as u32,
+            };
+            let (width, height, depth) = (extent(300), extent(300), extent(9));
+            let dimension = dimensions[(next() % 3) as usize];
+            // Each field is usually one the hardware takes, sometimes not.
+            let mut pick = |good: &[u32], any: u64| {
+                let r = next();
+                if r % 8 == 0 {
+                    (r >> 8) as u32 % any as u32
+                } else {
+                    good[(r >> 8) as usize % good.len()]
+                }
+            };
+            let modes = [0, 1, 2, 5, 6, 9, 10, 17, 18, 21, 22, 23, 24, 25, 26, 27];
+            let d = Desc {
+                dimension,
+                width,
+                height,
+                depth,
+                mips: pick(&[1, 1, 2, 3, 5, 9], 18),
+                element_bytes: pick(&[1, 2, 4, 8, 16], 33),
+                block: pick(&[1, 1, 4], 6),
+                samples: pick(&[1, 1, 1, 2, 4, 8], 17),
+                swizzle: Swizzle(pick(&modes, 34)),
+            };
+            let Ok(l) = Layout::new(&d) else { continue };
+            assert!(l.alignment.is_power_of_two(), "{d:?}");
+            if l.size > 1 << 22 {
+                continue;
+            }
+            let mut tiled = vec![0u8; l.size as usize];
+            for _ in 0..8 {
+                let mip = (next() % (u64::from(d.mips) + 2)) as u32;
+                // Mostly inside the mip, sometimes just past it.
+                let mut coordinate = |n: u32| {
+                    (next() % u64::from((n >> mip).div_ceil(d.block.max(1)).clamp(1, 512) + 1))
+                        as u32
+                };
+                let (x, y, z) = (
+                    coordinate(d.width),
+                    coordinate(d.height),
+                    coordinate(d.depth << mip),
+                );
+                if let Ok(offset) = l.offset(mip, x, y, z) {
+                    assert!(
+                        offset + u64::from(d.element_bytes) <= l.size,
+                        "{d:?} {mip} {x} {y} {z}"
+                    );
+                }
+                let slice = (next() % 10) as u32;
+                let row_pitch = match next() % 4 {
+                    0 => next() as usize,
+                    _ => (next() % 5000) as usize,
+                };
+                let depth_pitch = match next() % 4 {
+                    0 => next() as usize,
+                    _ => (next() % 200_000) as usize,
+                };
+                let mut linear = vec![0u8; (next() % 300_000) as usize];
+                let _ = l.detile(&tiled, mip, slice, &mut linear, row_pitch, depth_pitch);
+                let _ = l.tile(&mut tiled, mip, slice, &linear, row_pitch, depth_pitch);
+            }
+        }
+        for _ in 0..3000 {
+            let desc = TextureDesc {
+                dimension: dimensions[(next() % 3) as usize],
+                width: (next() % 5000) as u32,
+                height: (next() % 5000) as u32,
+                depth_or_array: (next() % 70) as u32,
+                mips: (next() % 18) as u32,
+                format: (next() % 200) as u32,
+                samples: [0, 1, 1, 1, 4, 3][(next() % 6) as usize],
+                swizzle: Swizzle([0, 5, 9, 22, 24, 26, 27, 30][(next() % 8) as usize]),
+            };
+            if let Ok(t) = Texture::new(&desc) {
+                let last = t.planes.last().unwrap();
+                assert_eq!(t.size, last.offset + last.layout.size);
+                assert!(t.planes.iter().all(|p| p.offset % p.layout.alignment == 0));
+            }
+        }
     }
 }
