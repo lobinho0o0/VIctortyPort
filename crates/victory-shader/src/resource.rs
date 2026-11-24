@@ -80,12 +80,25 @@ pub struct Descriptor {
     pub source: Source,
 }
 
+/// A view-heap descriptor whose byte address can be evaluated when binding
+/// the draw, using a table base and a root constant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RootIndexedView {
+    pub table_slot: u8,
+    pub constant_slot: u8,
+    pub constant_dword: u32,
+    pub byte_offset: u32,
+    pub shift: u8,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Resources {
     /// Every scalar memory access by address (`s_load_*`, `s_store_*`), and
     /// every global memory access (`global_*`, the dynamic term per lane).
     pub scalar: Vec<(Site, Address)>,
     pub descriptors: Vec<Descriptor>,
+    /// Direct descriptor sources with a draw-evaluable index.
+    pub root_indexed_views: Vec<RootIndexedView>,
     /// User SGPRs holding root parameters: value on entry, layout index,
     /// dword within the parameter.
     pub params: Vec<(Value, usize, u32)>,
@@ -154,6 +167,11 @@ pub fn track(p: &Program, layout: &[RootParam], stage: HwStage) -> Result<Resour
             }
         }
     }
+    out.root_indexed_views = out
+        .descriptors
+        .iter()
+        .filter_map(|d| t.root_indexed_view(d, &out.scalar))
+        .collect();
     Ok(out)
 }
 
@@ -319,7 +337,7 @@ impl<'a> Tracer<'a> {
         })
     }
 
-    /// The SOP2 operands of `v` if an `s_add` with one of `names` wrote it.
+    /// The SOP2 operands of `v` if an instruction with one of `names` wrote it.
     fn sop2(&self, v: Value, names: &[&str]) -> Option<(&'a Inst, [Term; 2])> {
         let inst = self.def(v)?;
         if !names.contains(&inst.name()) || inst.writes.first()?.1 != v {
@@ -335,6 +353,42 @@ impl<'a> Tracer<'a> {
                 self.term(inst, src.get(1)?)?,
             ],
         ))
+    }
+
+    fn root_indexed_view(
+        &self,
+        descriptor: &Descriptor,
+        scalar: &[(Site, Address)],
+    ) -> Option<RootIndexedView> {
+        if descriptor.role != Role::Resource {
+            return None;
+        }
+        let Source::Loaded { load, first } = descriptor.source else {
+            return None;
+        };
+        let i = scalar.binary_search_by_key(&load, |(site, _)| *site).ok()?;
+        let address = scalar[i].1;
+        let base = self.layout.get(address.param)?;
+        if base.root != RootType::Table {
+            return None;
+        }
+        let dynamic = address.dynamic?;
+        let (input, shift) = match self.sop2(dynamic, &["s_lshl_b32"]) {
+            Some((_, [Term::Value(input), Term::Const(shift)])) => (input, (shift & 31) as u8),
+            _ => (dynamic, 0),
+        };
+        let (param, constant_dword) = self.param_of(self.inputs[input.0 as usize]?)?;
+        let constant = self.layout.get(param)?;
+        if constant.root != RootType::Constants {
+            return None;
+        }
+        Some(RootIndexedView {
+            table_slot: base.slot,
+            constant_slot: constant.slot,
+            constant_dword,
+            byte_offset: address.offset.wrapping_add(u32::from(first) * 4),
+            shift,
+        })
     }
 
     fn sum(&self, t: Term) -> Sum {
@@ -1012,16 +1066,17 @@ mod tests {
     fn heap_indices_from_root_constants_in_a_merged_stage() {
         // User data starts at s8: the constant (index 6) is s14, the heap
         // (index 10) s18.
+        let code = [
+            0x8F08_850E, // s_lshl_b32 s8, s14, 5
+            0xBE93_0380, // s_mov_b32 s19, 0
+            0xF408_0209,
+            0x1000_0000, // s_load_dwordx4 s[8:11], s[18:19], s8
+            0xE000_2000,
+            0x8002_0400, // buffer_load_format_x v4, v0, s[8:11], 0 idxen
+            S_ENDPGM,
+        ];
         let r = track_words(
-            &[
-                0x8F08_850E, // s_lshl_b32 s8, s14, 5
-                0xBE93_0380, // s_mov_b32 s19, 0
-                0xF408_0209,
-                0x1000_0000, // s_load_dwordx4 s[8:11], s[18:19], s8
-                0xE000_2000,
-                0x8002_0400, // buffer_load_format_x v4, v0, s[8:11], 0 idxen
-                S_ENDPGM,
-            ],
+            &code,
             &[param(Constants, 6, 1), param(ResourceHeap, 10, 1)],
             HwStage::Ms,
         );
@@ -1037,6 +1092,24 @@ mod tests {
                 first: 0
             }
         );
+        assert!(r.root_indexed_views.is_empty());
+        let table = RootParam {
+            slot: 7,
+            ..param(Table, 10, 1)
+        };
+        let indexed = track_words(&code, &[param(Constants, 6, 1), table], HwStage::Ms);
+        assert_eq!(
+            indexed.root_indexed_views,
+            [RootIndexedView {
+                table_slot: 7,
+                constant_slot: 0,
+                constant_dword: 0,
+                byte_offset: 0,
+                shift: 5,
+            }]
+        );
+        let nonconstant = track_words(&code, &[param(Table, 6, 1), table], HwStage::Ms);
+        assert!(nonconstant.root_indexed_views.is_empty());
     }
 
     #[test]
