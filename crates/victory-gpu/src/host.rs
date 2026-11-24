@@ -34,6 +34,7 @@ pub(crate) fn texture_state(state: u32) -> u32 {
 /// Render target views live only until their command is recorded, so a
 /// ring of host descriptors is enough.
 const RTV_RING: u32 = 1024;
+type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
@@ -41,6 +42,7 @@ pub(crate) struct Host {
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
+    indirect_prelude: OnceLock<windows::core::Result<Prelude>>,
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
@@ -110,11 +112,20 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
             None => {}
         }
     }
+    #[cfg(test)]
+    if validate_d3d12_tests() {
+        panic!("{text}");
+    }
     tracing::error!("{text}");
     match ON_FAILURE.get() {
         Some(report) => report(&text),
         None => std::process::abort(),
     }
+}
+
+#[cfg(test)]
+fn validate_d3d12_tests() -> bool {
+    std::env::var_os("VICTORY_TEST_D3D12_VALIDATE").is_some()
 }
 
 /// The host GPU, created on first use; `None` without one (a run then
@@ -124,6 +135,11 @@ pub(crate) fn host() -> Option<&'static Host> {
     HOST.get_or_init(|| match create() {
         Ok(host) => Some(host),
         Err(e) => {
+            #[cfg(test)]
+            assert!(
+                !validate_d3d12_tests(),
+                "could not create the validation device: {e}"
+            );
             tracing::warn!(error = %e, "no host D3D12 device; command lists will not run");
             None
         }
@@ -145,15 +161,30 @@ fn create() -> windows::core::Result<Host> {
             }
             // GPU-based validation (`VICTORY_D3D12_GBV`): out-of-range
             // descriptor heap indices and the like become messages naming
-            // the command instead of page faults. Without state tracking
-            // (directly indexed textures are not transitioned).
+            // the command instead of page faults. Production diagnostics
+            // skip state tracking for directly indexed textures. Strict
+            // GPU tests keep it enabled.
             if std::env::var_os("VICTORY_D3D12_GBV").is_some()
                 && let Some(l) = &layer
             {
                 if let Ok(d1) = l.cast::<ID3D12Debug1>() {
                     d1.SetEnableGPUBasedValidation(true);
+                    #[cfg(test)]
+                    if validate_d3d12_tests() {
+                        eprintln!("GPU-based validation enabled with resource state tracking");
+                    }
+                } else {
+                    #[cfg(test)]
+                    assert!(
+                        !validate_d3d12_tests(),
+                        "GPU-based validation is unavailable"
+                    );
                 }
-                if let Ok(d2) = l.cast::<ID3D12Debug2>() {
+                #[cfg(test)]
+                let disable_state_tracking = !validate_d3d12_tests();
+                #[cfg(not(test))]
+                let disable_state_tracking = true;
+                if disable_state_tracking && let Ok(d2) = l.cast::<ID3D12Debug2>() {
                     d2.SetGPUBasedValidationFlags(
                         D3D12_GPU_BASED_VALIDATION_FLAGS_DISABLE_STATE_TRACKING,
                     );
@@ -187,6 +218,19 @@ fn create() -> windows::core::Result<Host> {
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
+        #[cfg(test)]
+        if validate_d3d12_tests() {
+            assert!(messages.is_some(), "D3D12 debug layer is not active");
+            let luid = device.GetAdapterLuid();
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+            let adapter: IDXGIAdapter1 = factory.EnumAdapterByLuid(luid)?;
+            let desc = adapter.GetDesc1()?;
+            let name = String::from_utf16_lossy(&desc.Description);
+            eprintln!(
+                "D3D12 debug layer active on {}",
+                name.trim_end_matches('\0')
+            );
+        }
         let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
             Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
             ..Default::default()
@@ -213,6 +257,7 @@ fn create() -> windows::core::Result<Host> {
             queue,
             fence,
             submitted: Mutex::new(0),
+            indirect_prelude: OnceLock::new(),
             event,
             rtvs,
             rtv_size,
@@ -293,10 +338,10 @@ pub(crate) struct HostList {
     /// resource first.
     states: Mutex<States>,
     /// The list that runs those transitions just before this one.
-    prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
+    prelude: Prelude,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
-    /// The work its indirect executions may still do (`indirect`): a
+    /// The work its indirect executions have reserved (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -399,6 +444,8 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// Whole buffers whose indirect uses need enhanced barriers.
+    indirect_buffers: std::collections::HashMap<usize, ID3D12Resource>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -407,8 +454,6 @@ struct Deferred {
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
-    /// Whether a step zeroes the indirect-work budget.
-    budget_zeroed: bool,
 }
 
 impl Host {
@@ -460,23 +505,13 @@ impl Host {
                 &allocator,
                 None,
             )?;
-            let prelude_allocator: ID3D12CommandAllocator = self
-                .device
-                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-            let prelude: ID3D12GraphicsCommandList = self.device.CreateCommandList(
-                0,
-                D3D12_COMMAND_LIST_TYPE_DIRECT,
-                &prelude_allocator,
-                None,
-            )?;
-            prelude.Close()?;
             Ok(HostList {
                 allocator,
                 list,
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
-                prelude: (prelude_allocator, prelude),
+                prelude: self.new_prelude()?,
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 #[cfg(feature = "diagnostics")]
@@ -485,6 +520,68 @@ impl Host {
                 stamps: OnceLock::new(),
             })
         }
+    }
+
+    fn new_prelude(&self) -> windows::core::Result<Prelude> {
+        // SAFETY: a direct allocator and a list created against it.
+        unsafe {
+            let allocator = self
+                .device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+            let list: ID3D12GraphicsCommandList = self.device.CreateCommandList(
+                0,
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                &allocator,
+                None,
+            )?;
+            list.Close()?;
+            Ok((allocator, list))
+        }
+    }
+
+    /// Selects enhanced barriers for all indirect buffers before any list
+    /// in this submission can implicitly promote them to a legacy state.
+    /// The submission lock prevents reuse while a prior prelude is running.
+    fn indirect_prelude(
+        &self,
+        runs: &[&HostList],
+    ) -> windows::core::Result<Option<ID3D12CommandList>> {
+        let mut buffers = std::collections::HashMap::new();
+        for list in runs {
+            buffers.extend(
+                list.deferred()
+                    .indirect_buffers
+                    .iter()
+                    .map(|(&key, buffer)| (key, buffer.clone())),
+            );
+            if let Some(Some((_, data))) = list.budget.get() {
+                // SAFETY: this list's budget is mapped, and under the
+                // submission lock the GPU finished any prior use.
+                unsafe { (*data as *mut u32).write_volatile(0) };
+            }
+        }
+        if buffers.is_empty() {
+            return Ok(None);
+        }
+        let (allocator, list) = self
+            .indirect_prelude
+            .get_or_init(|| self.new_prelude())
+            .as_ref()
+            .map_err(Clone::clone)?;
+        // SAFETY: the preceding submission finished, and buffers live
+        // through this submission. A new submission starts them in COMMON.
+        unsafe {
+            allocator.Reset()?;
+            list.Reset(allocator, None)?;
+            crate::indirect::buffer_barriers(
+                &list.cast::<ID3D12GraphicsCommandList7>()?,
+                buffers.values(),
+                (D3D12_BARRIER_SYNC_NONE, D3D12_BARRIER_ACCESS_NO_ACCESS),
+                (D3D12_BARRIER_SYNC_ALL, D3D12_BARRIER_ACCESS_COMMON),
+            );
+            list.Close()?;
+        }
+        list.cast().map(Some)
     }
 
     /// Runs closed lists and waits for them.
@@ -523,6 +620,23 @@ impl Host {
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
         for (i, group) in groups.iter().enumerate() {
+            // Buffer state decays at each ExecuteCommandLists boundary.
+            // In timing mode each list is a separate submission.
+            let submitted_runs = if groups.len() > 1 {
+                &runs[i..i + 1]
+            } else {
+                runs
+            };
+            let mut prefixed = Vec::new();
+            let group = match self.indirect_prelude(submitted_runs) {
+                Ok(Some(prelude)) => {
+                    prefixed.push(Some(prelude));
+                    prefixed.extend_from_slice(group);
+                    prefixed.as_slice()
+                }
+                Ok(None) => group,
+                Err(e) => fail(format_args!("indirect buffer prelude did not record ({e})")),
+            };
             *submitted += 1;
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
@@ -601,7 +715,12 @@ impl Host {
                 what.write(at as *mut u8, bytes);
             }
         }
-        self.log_messages();
+        let error = self.log_messages();
+        #[cfg(test)]
+        if validate_d3d12_tests() {
+            assert!(error.is_none(), "D3D12 debug layer reported {error:?}");
+        }
+        let _ = error;
     }
 
     /// With `VICTORY_D3D12_DRED`: the faulting address and the allocations
@@ -1105,27 +1224,28 @@ impl HostList {
         Some((gpu + at, (data + at as usize) as *mut u8))
     }
 
-    /// The host address of the list's indirect-work budget, zeroed at each
-    /// submission of the list from the first use after a reset on.
-    pub(crate) fn budget(&self) -> Option<u64> {
-        let (buffer, data) = self
-            .budget
+    /// The list's indirect-work budget, zeroed before each submission.
+    pub(crate) fn budget(&self) -> Option<&ID3D12Resource> {
+        self.budget
             .get_or_init(|| {
                 let (b, d) = host()?.shared_buffer(256)?;
                 Some((b, d as usize))
             })
-            .as_ref()?;
+            .as_ref()
+            .map(|(buffer, _)| buffer)
+    }
+
+    pub(crate) fn use_indirect_buffers<'a>(
+        &self,
+        buffers: impl IntoIterator<Item = &'a ID3D12Resource>,
+    ) {
         let mut deferred = self.deferred();
-        if !deferred.budget_zeroed {
-            deferred.budget_zeroed = true;
-            let at = *data;
-            // SAFETY: the list's own mapped word, written before it runs.
+        for buffer in buffers {
             deferred
-                .copies
-                .push(Step::Host(Box::new(move || unsafe { (at as *mut u32).write_volatile(0) })));
+                .indirect_buffers
+                .entry(buffer.as_raw() as usize)
+                .or_insert_with(|| buffer.clone());
         }
-        // SAFETY: a live buffer.
-        Some(unsafe { buffer.GetGPUVirtualAddress() })
     }
 
     /// Keeps `object` alive until the list is reset.

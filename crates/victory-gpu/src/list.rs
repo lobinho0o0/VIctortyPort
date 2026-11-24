@@ -289,8 +289,7 @@ pub(crate) struct Barrier {
     last: u64,
 }
 
-/// The barrier on host resources, or `None` if it names a resource the host
-/// GPU does not have (buffers so far).
+/// The barrier on host resources, if the host mirrors the transition.
 #[cfg(windows)]
 fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
     use windows::core::Interface;
@@ -301,6 +300,30 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             const BEGIN_ONLY: u32 = 1;
             if b.flags & BEGIN_ONLY != 0 {
                 return None;
+            }
+            const INDIRECT_ARGUMENT: u32 = 0x200;
+            const UAV: u32 = 0x8;
+            let before = crate::host::pc_state((b.second >> 32) as u32);
+            let after = crate::host::pc_state(b.last as u32);
+            let indirect_handoff = (before == INDIRECT_ARGUMENT
+                && matches!(after, UAV | COPY_DEST))
+                || (after == INDIRECT_ARGUMENT && matches!(before, UAV | COPY_DEST));
+            if indirect_handoff
+                && let Some((data, _)) = crate::resource::buffer_bytes(b.first)
+                && crate::indirect::enhanced_list(list).is_none()
+                && let Some(shadow) = crate::shadow::existing(b.first as usize, data as u64)
+            {
+                // Preserve the title's handoff between a producer and
+                // indirect execution. Either native use can promote from
+                // COMMON, including the argument clamp's UAV access.
+                list.keep(&shadow.buffer);
+                return Some(Barrier {
+                    kind: 0,
+                    flags: 0,
+                    first: shadow.buffer.as_raw().cast_const().cast(),
+                    second: 0xffff_ffff | (u64::from(before) << 32),
+                    last: 0,
+                });
             }
             // shortcut: whole resources, from the state the list tracked
             // (`HostList::transition`); subresources are not told apart.
@@ -369,21 +392,41 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             host.push(UAV_BARRIER);
         }
         if !host.is_empty() {
-            use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
-            const _: () = assert!(size_of::<Barrier>() == size_of::<D3D12_RESOURCE_BARRIER>());
-            // SAFETY: the same layout; borrowed resource pointers, never
-            // released through this slice.
-            let host = unsafe {
-                std::slice::from_raw_parts(
-                    host.as_ptr().cast::<D3D12_RESOURCE_BARRIER>(),
-                    host.len(),
-                )
-            };
-            // SAFETY: an open list and live resources.
-            unsafe { list.list.ResourceBarrier(host) };
+            record_barriers(list, &host);
         }
     }
     0
+}
+
+#[cfg(windows)]
+fn record_barriers(list: &crate::host::HostList, barriers: &[Barrier]) {
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+    const _: () = assert!(size_of::<Barrier>() == size_of::<D3D12_RESOURCE_BARRIER>());
+    // SAFETY: identical layout, with live, borrowed resources on an open list.
+    unsafe {
+        list.list.ResourceBarrier(std::slice::from_raw_parts(
+            barriers.as_ptr().cast::<D3D12_RESOURCE_BARRIER>(),
+            barriers.len(),
+        ));
+    }
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn test_buffer_handoff(
+    list: &crate::host::HostList,
+    resource: This,
+    before: u32,
+    after: u32,
+) {
+    let title = Barrier {
+        kind: 0,
+        flags: 0,
+        first: resource,
+        second: 0xffff_ffff | (u64::from(before) << 32),
+        last: u64::from(after),
+    };
+    let host = host_barrier(list, &title).expect("legacy buffer handoff");
+    record_barriers(list, &[host]);
 }
 
 /// Moves a title texture's host copy to `state` in the list, if needed.
@@ -1150,16 +1193,31 @@ extern "system" fn execute_indirect(
     let Some((stride, args)) = crate::signature::layout(signature) else {
         return;
     };
-    let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
-    let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
+    let arguments = crate::resource::buffer_bytes(arguments);
+    #[cfg(windows)]
+    let indirect = match args {
+        [[kind, ..]] => {
+            const DISPATCH: u32 = 2;
+            const DISPATCH_SINGLE: u32 = 105;
+            let kind = if *kind == DISPATCH_SINGLE {
+                DISPATCH
+            } else {
+                *kind
+            };
+            indirect_arguments(arguments, offset, (kind, stride, max)).map(|at| (kind, at))
+        }
+        _ => None,
+    };
+    #[cfg(windows)]
+    let address = indirect.map(|(_, at)| at);
+    #[cfg(not(windows))]
+    let address = indirect_address(arguments, offset, u64::from(stride) * u64::from(max));
+    let counter = indirect_address(crate::resource::buffer_bytes(count), count_offset, 4);
     let mut ran = false;
     #[cfg(windows)]
-    if let ([[kind, ..]], Some(address)) = (args, address)
+    if let Some((kind, address)) = indirect
         && (count.is_null() || counter.is_some())
     {
-        const DISPATCH: u32 = 2;
-        const DISPATCH_SINGLE: u32 = 105;
-        let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
         with_state(this, |list, s| {
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
@@ -1188,6 +1246,29 @@ extern "system" fn execute_indirect(
             "indirect execution dropped (first time for this signature)"
         );
     }
+}
+
+#[cfg(windows)]
+fn indirect_arguments(
+    buffer: Option<(*mut u8, u64)>,
+    offset: u64,
+    (kind, stride, records): (u32, u32, u32),
+) -> Option<u64> {
+    indirect_address(
+        buffer,
+        offset,
+        crate::indirect::byte_len(kind, stride, records)?,
+    )
+}
+
+/// Check against the title buffer before resolving its host copy, which
+/// may include other memory or padding beyond the title's buffer.
+fn indirect_address(buffer: Option<(*mut u8, u64)>, offset: u64, len: u64) -> Option<u64> {
+    let (base, size) = buffer?;
+    if !offset.is_multiple_of(4) || offset.checked_add(len)? > size {
+        return None;
+    }
+    (base as u64).checked_add(offset)
 }
 
 /// Indirect executions dropped since the last call.
@@ -1392,6 +1473,37 @@ static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[cfg(windows)]
+    #[test]
+    fn indirect_arguments_fit_the_title_buffer_without_trailing_padding() {
+        let mut data = [0u8; 32];
+        let base = data.as_mut_ptr();
+        let records = (2, 16, 2);
+        assert_eq!(
+            indirect_arguments(Some((base, 28)), 0, records),
+            Some(base as u64)
+        );
+        assert_eq!(indirect_arguments(Some((base, 27)), 0, records), None);
+        assert_eq!(
+            indirect_arguments(Some((base, 32)), 4, records),
+            Some(base as u64 + 4)
+        );
+        assert_eq!(indirect_arguments(Some((base, 31)), 4, records), None);
+        assert_eq!(indirect_arguments(Some((base, 32)), 2, records), None);
+        assert_eq!(
+            indirect_arguments(Some((base, 12)), 0, (2, 16, 1)),
+            Some(base as u64)
+        );
+        assert_eq!(
+            indirect_arguments(Some((base, 32)), 32, (2, 16, 0)),
+            Some(base as u64 + 32)
+        );
+        assert_eq!(
+            indirect_arguments(Some((base, u64::MAX)), u64::MAX - 3, records),
+            None
+        );
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {

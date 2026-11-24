@@ -951,25 +951,32 @@ impl State {
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
-        let len = u64::from(stride) * u64::from(max.max(1));
+        let Some(len) = crate::indirect::byte_len(kind, stride, max) else {
+            why("invalid indirect record layout");
+            return false;
+        };
+        if max == 0 {
+            return true;
+        }
         let Some(args) = crate::shadow::find(arguments, len) else {
             why("arguments outside title buffers");
             return false;
         };
+        if !args.offset(arguments).is_multiple_of(4) {
+            why("unaligned argument offset in host buffer");
+            return false;
+        }
         let counter = match count {
             Some(at) => match crate::shadow::find(at, 4) {
-                Some(s) => Some((s, at)),
-                None => {
-                    why("count outside title buffers");
+                Some(s) if s.offset(at).is_multiple_of(4) => Some((s, at)),
+                _ => {
+                    why("count outside title buffers or unaligned in host buffer");
                     return false;
                 }
             },
             None => None,
         };
-        let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
-            .then(|| host_signature(kind, stride))
-            .flatten()
-        else {
+        let Some(signature) = host_signature(kind, stride) else {
             why("no host signature");
             return false;
         };
@@ -977,9 +984,16 @@ impl State {
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
+        let count_buffer = counter.as_ref().map(|(s, _)| &s.buffer);
         // Bounded first: the clamp binds a compute pipeline of its own.
-        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
-            why("not bounded (no clamp, or arguments not 4-byte aligned)");
+        if !crate::indirect::bound(
+            list,
+            &args.buffer,
+            args.offset(arguments),
+            count_buffer,
+            (kind, stride, max),
+        ) {
+            why("not bounded (no clamp or invalid argument range)");
             return false;
         }
         self.host_pipeline = 0;
@@ -997,7 +1011,7 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &args.buffer);
+            crate::indirect::done(list, &args.buffer, count_buffer);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
@@ -1017,11 +1031,11 @@ impl State {
                 max,
                 &args.buffer,
                 args.offset(arguments),
-                counter.as_ref().map(|(s, _)| &s.buffer),
+                count_buffer,
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
-        crate::indirect::done(list, &args.buffer);
+        crate::indirect::done(list, &args.buffer, count_buffer);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {

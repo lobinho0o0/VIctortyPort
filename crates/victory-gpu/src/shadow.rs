@@ -393,6 +393,12 @@ pub(crate) fn unregister(resource: usize, start: u64) {
     buffers().remove(&(start, resource));
 }
 
+/// The existing copy of this title resource, without creating a shadow or
+/// choosing a differently sized alias by address.
+pub(crate) fn existing(resource: usize, start: u64) -> Option<Arc<Shadow>> {
+    buffers().get(&(start, resource))?.shadow.clone()
+}
+
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
