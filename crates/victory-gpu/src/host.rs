@@ -296,6 +296,8 @@ pub(crate) struct HostList {
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
+    /// Queries begun in the list and not ended yet: host heap, type, index.
+    queries: Mutex<Vec<(ID3D12QueryHeap, D3D12_QUERY_TYPE, u32)>>,
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
@@ -478,6 +480,7 @@ impl Host {
                 states: Mutex::default(),
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
+                queries: Mutex::default(),
                 budget: OnceLock::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
@@ -596,12 +599,45 @@ impl Host {
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+        // Host timestamps the lists resolved, on the title's GPU clock.
+        let mut clock = None;
         for list in runs {
             for &(at, what, bytes) in &list.deferred().writes {
+                let what = match what {
+                    crate::queue::Written::HostTimestamp(raw) => match clock.get_or_insert_with(|| self.clock()) {
+                        // SAFETY: the list's mapped read-back memory, which
+                        // the submission that ran resolved into.
+                        Some(c) => crate::queue::Written::Value(c.convert(unsafe { (raw as *const u64).read_volatile() })),
+                        None => crate::queue::Written::GpuTimestamp,
+                    },
+                    what => what,
+                };
                 what.write(at as *mut u8, bytes);
             }
         }
         self.log_messages();
+    }
+
+    /// How host GPU timestamps map onto the title's GPU clock
+    /// ([`crate::queue::Written::GpuTimestamp`]): the queue's calibration
+    /// of its timestamps against the CPU's performance counter, which
+    /// `Instant` reads too.
+    fn clock(&self) -> Option<Clock> {
+        use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
+        let (mut gpu, mut cpu, mut now, mut cpu_frequency) = (0, 0, 0, 0);
+        // SAFETY: plain queries into our locals.
+        let frequency = unsafe {
+            let frequency = self.queue.GetTimestampFrequency().ok()?;
+            self.queue.GetClockCalibration(&mut gpu, &mut cpu).ok()?;
+            QueryPerformanceCounter(&mut now);
+            QueryPerformanceFrequency(&mut cpu_frequency);
+            frequency
+        };
+        let title_now = crate::queue::gpu_clock();
+        let ticks = i128::from(crate::queue::TIMESTAMP_FREQUENCY);
+        // The title's clock when the host GPU's read `gpu`.
+        let since = (i128::from(now) - i128::from(cpu)) * ticks / i128::from(cpu_frequency.max(1));
+        (frequency > 0).then_some(Clock { gpu, at: i128::from(title_now) - since, frequency, now: title_now })
     }
 
     /// With `VICTORY_D3D12_DRED`: the faulting address and the allocations
@@ -780,6 +816,25 @@ impl Host {
     }
 }
 
+/// A host GPU timestamp `gpu` taken when the title's GPU clock read `at`,
+/// the host's ticks per second, and the title's clock when taken.
+struct Clock {
+    gpu: u64,
+    at: i128,
+    frequency: u64,
+    now: u64,
+}
+
+impl Clock {
+    /// A host GPU timestamp on the title's clock: never past the time it
+    /// was read, so bottom-of-pipe timestamps written after stay later.
+    fn convert(&self, raw: u64) -> u64 {
+        let ticks = i128::from(crate::queue::TIMESTAMP_FREQUENCY);
+        let since = (i128::from(raw) - i128::from(self.gpu)) * ticks / i128::from(self.frequency);
+        (self.at + since).clamp(0, i128::from(self.now)) as u64
+    }
+}
+
 impl HostList {
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
     #[cfg(feature = "diagnostics")]
@@ -858,6 +913,12 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        // The host closes no list with queries running; their title ends,
+        // in a later list, are dropped (`end_query`).
+        for (heap, kind, index) in self.queries.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
+            // SAFETY: an open list and a query begun in it.
+            unsafe { self.list.EndQuery(&heap, kind, index) };
+        }
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -881,6 +942,7 @@ impl HostList {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.queries.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
@@ -998,6 +1060,40 @@ impl HostList {
         }
     }
 
+    /// Begins query `index` of `heap` (occlusion or statistics, never a
+    /// timestamp) unless it is running in the list already. Whether it
+    /// began.
+    pub(crate) fn begin_query(&self, heap: &ID3D12QueryHeap, kind: u32, index: u32) -> bool {
+        let mut queries = self.queries.lock().unwrap_or_else(|e| e.into_inner());
+        if kind == crate::query::TIMESTAMP || queries.iter().any(|(h, _, i)| h == heap && *i == index) {
+            return false;
+        }
+        let kind = D3D12_QUERY_TYPE(kind as i32);
+        // SAFETY: an open list and a live heap, kept until the list is reset.
+        unsafe { self.list.BeginQuery(heap, kind, index) };
+        queries.push((heap.clone(), kind, index));
+        drop(queries);
+        self.keep(heap);
+        true
+    }
+
+    /// Ends query `index` of `heap`: a timestamp is taken; another query
+    /// ends only if it began in this list, as the type it began as. The
+    /// type it ended as, if it did.
+    pub(crate) fn end_query(&self, heap: &ID3D12QueryHeap, kind: u32, index: u32) -> Option<u32> {
+        let kind = if kind == crate::query::TIMESTAMP {
+            D3D12_QUERY_TYPE(kind as i32)
+        } else {
+            let mut queries = self.queries.lock().unwrap_or_else(|e| e.into_inner());
+            let at = queries.iter().position(|(h, _, i)| h == heap && *i == index)?;
+            queries.swap_remove(at).1
+        };
+        // SAFETY: an open list and a live heap, kept until the list is reset.
+        unsafe { self.list.EndQuery(heap, kind, index) };
+        self.keep(heap);
+        Some(kind.0 as u32)
+    }
+
     /// Notes a pipeline the list binds.
     pub(crate) fn used_pipeline(&self, name: &str) {
         let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
@@ -1072,6 +1168,42 @@ impl HostList {
         name(&buffer, || format!("list upload {size:#x}"));
         self.deferred().uploads.push(buffer.clone());
         Some((buffer, data))
+    }
+
+    /// A mapped read-back buffer of `size` bytes, alive until the list is
+    /// reset.
+    pub(crate) fn readback(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: plain creation and mapping of a read-back buffer.
+        let made = unsafe {
+            host()?
+                .device
+                .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut buffer)
+                .and_then(|()| {
+                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                    b.Map(0, None, Some(&mut data))
+                })
+        };
+        if let Err(e) = made {
+            tracing::warn!(error = %e, size, "no read-back buffer");
+            return None;
+        }
+        let buffer = buffer?;
+        name(&buffer, || format!("list read-back {size:#x}"));
+        self.deferred().uploads.push(buffer.clone());
+        Some((buffer, data.cast()))
     }
 
     /// `len` bytes of upload memory (256-byte aligned) until the list is

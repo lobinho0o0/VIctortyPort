@@ -176,7 +176,15 @@ extern "system" fn timestamp_frequency(_: This, out: *mut u64) -> HRESULT {
     unsafe { out.write(TIMESTAMP_FREQUENCY) };
     S_OK
 }
-const TIMESTAMP_FREQUENCY: u64 = 100_000_000;
+pub(crate) const TIMESTAMP_FREQUENCY: u64 = 100_000_000;
+
+/// The GPU clock: [`TIMESTAMP_FREQUENCY`] ticks per second since the
+/// process first asked.
+pub(crate) fn gpu_clock() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
+    (elapsed.as_nanos() / (1_000_000_000 / u128::from(TIMESTAMP_FREQUENCY))) as u64
+}
 
 /// What a list's bottom-of-pipe write stores when the list has run.
 #[derive(Debug, Clone, Copy)]
@@ -187,6 +195,9 @@ pub(crate) enum Written {
     GpuTimestamp,
     /// The CPU's performance counter.
     SystemTimestamp,
+    /// A host GPU timestamp read back at this address, put on the GPU clock
+    /// by the submission that resolved it (the GPU clock now elsewhere).
+    HostTimestamp(usize),
 }
 
 impl Written {
@@ -194,11 +205,7 @@ impl Written {
     pub(crate) fn write(self, at: *mut u8, bytes: usize) {
         let value = match self {
             Written::Value(v) => v,
-            Written::GpuTimestamp => {
-                static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-                let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
-                (elapsed.as_nanos() / (1_000_000_000 / u128::from(TIMESTAMP_FREQUENCY))) as u64
-            }
+            Written::GpuTimestamp | Written::HostTimestamp(_) => gpu_clock(),
             Written::SystemTimestamp => system_timestamp(),
         };
         // SAFETY: the title names writable GPU memory (unified with ours).

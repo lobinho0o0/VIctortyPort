@@ -99,6 +99,13 @@ impl Shadow {
         address - self.start
     }
 
+    /// The copy's bytes at `[address, address + len)` (inside the buffer).
+    #[cfg(test)]
+    pub(crate) fn host_bytes(&self, address: u64, len: usize) -> Vec<u8> {
+        // SAFETY: inside the mapping; no submission runs while tests read.
+        unsafe { std::slice::from_raw_parts(self.data.add(self.offset(address) as usize), len) }.to_vec()
+    }
+
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
