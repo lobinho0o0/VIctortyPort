@@ -805,9 +805,15 @@ fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
     } else if name.contains("_mip") {
         packed += 1;
     }
-    if a16 {
-        whole + 2 * derivs.div_ceil(2) + packed.div_ceil(2)
+    // On GFX10.3, `a16` packs coordinates/LOD/clamp into 16-bit pairs (and
+    // bias stays in its own VGPR as an f16 in the low half), while derivatives
+    // remain 32-bit unless the opcode is a `_g16` form.
+    let g16 = name.ends_with("_g16");
+    let deriv_dwords = if g16 {
+        2 * derivs.div_ceil(2)
     } else {
-        whole + 2 * derivs + packed
-    }
+        2 * derivs
+    };
+    let coord_dwords = if a16 { packed.div_ceil(2) } else { packed };
+    whole + deriv_dwords + coord_dwords
 }
