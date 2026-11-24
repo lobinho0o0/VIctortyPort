@@ -178,16 +178,27 @@ fn show_config() -> Result<()> {
             .as_ref()
             .map_or("(none)".into(), |p| p.display().to_string())
     );
-    println!("game_dir    : {}", status(&cfg.game_dir));
-    println!("cache_dir   : {}", cfg.cache_dir.display());
+    // Where each value came from, so it is clear which setting to change.
+    let o = cfg.origins;
+    println!("game_dir    : {}  [{}]", status(&cfg.game_dir), o.game_dir);
+    println!(
+        "cache_dir   : {}  [{}]",
+        cfg.cache_dir.display(),
+        o.cache_dir
+    );
+    println!("data_dir    : {}  [{}]", cfg.data_dir.display(), o.data_dir);
     for t in &cfg.test_titles {
-        println!("test_title  : {}", status(&Some(t.clone())));
+        println!(
+            "test_title  : {}  [{}]",
+            status(&Some(t.clone())),
+            o.test_titles
+        );
     }
     for p in cfg
         .game_dir
         .iter()
         .chain(&cfg.test_titles)
-        .chain([&cfg.cache_dir])
+        .chain([&cfg.cache_dir, &cfg.data_dir])
     {
         if let Err(e) = victory_core::ensure_outside_repo(p) {
             println!("POLICY VIOLATION: {e}");
