@@ -37,6 +37,9 @@ pub(crate) struct Lowered {
     pub root_srvs: Vec<u8>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
+    /// The names of the emitted functions (which dx.ops ran); tests only.
+    #[cfg(test)]
+    pub op_names: Vec<String>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -883,6 +886,8 @@ impl<'a> Lower<'a> {
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
+        #[cfg(test)]
+        let op_names = self.s.m.func_names().map(str::to_owned).collect();
         Ok(Lowered {
             cmp_samplers,
             root_cbvs,
@@ -890,6 +895,8 @@ impl<'a> Lower<'a> {
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
+            #[cfg(test)]
+            op_names,
         })
     }
 
@@ -1186,7 +1193,21 @@ impl<'a> Lower<'a> {
                 xy
             }
         };
-        Ok(if high { y } else { x })
+        Ok(if high {
+            y
+        } else if self.mask_data == MaskData::Host && !self.x.native.wave64 {
+            // A wave32 program's host wave may still have 64 lanes, whose
+            // upper half is a second console wave: its bits are the ballot's
+            // second dword.
+            let lane = self.lane_index();
+            let c = self.cur;
+            let k32 = self.s.m.i32(32);
+            let upper = self.s.m.cmp(c, pred::IUGE, lane, k32);
+            self.s.flags |= flags::WAVE_OPS;
+            self.s.m.select(c, upper, y, x)
+        } else {
+            x
+        })
     }
 
     // ---- operands ----
@@ -4907,9 +4928,19 @@ impl<'a> Lower<'a> {
                 } else if self.s.mesh.is_none() {
                     self.cross_lane(false)?;
                 }
+                // On a host wave wider than the console's the upper half is a
+                // second console wave: `lo` counts bits of the lane's own
+                // half's mask below its lane in it, and a wave32 mask's high
+                // half is empty.
+                let host_halves = self.mask_data == MaskData::Host && !self.x.native.wave64;
                 let lane = self.lane_index();
                 let below = if name == "v_mbcnt_lo_u32_b32" {
-                    lane
+                    if host_halves {
+                        let k31 = k(self, 31);
+                        self.s.m.bin(c, Bin::And, lane, k31)
+                    } else {
+                        lane
+                    }
                 } else {
                     let (k32, z) = (k(self, 32), k(self, 0));
                     let t = self.s.m.bin(c, Bin::Sub, lane, k32);
@@ -4923,7 +4954,11 @@ impl<'a> Lower<'a> {
                 let m = self.s.m.bin(c, Bin::Sub, m, one);
                 let full = self.s.m.cmp(c, pred::IUGE, below, k32);
                 let m = self.s.m.select(c, full, ones, m);
-                let x = self.s.m.bin(c, Bin::And, a, m);
+                let x = if host_halves && name == "v_mbcnt_hi_u32_b32" {
+                    k(self, 0)
+                } else {
+                    self.s.m.bin(c, Bin::And, a, m)
+                };
                 let n = self
                     .s
                     .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, 31, &[x]);
@@ -6628,6 +6663,60 @@ mod tests {
         for words in [add, sub] {
             lowers(&words).unwrap();
         }
+    }
+
+    /// A wave32 graphics program's host wave may have 64 lanes, whose upper
+    /// half is a second console wave: a lane mask read as a number picks the
+    /// reader's half of the ballot, so the reader's lane index is needed.
+    #[test]
+    fn a_wave32_mask_read_takes_its_ballot_half() {
+        let words = [
+            0x7D8A_0480, // v_cmp_ne_u32 vcc, 0, v2
+            0xBE84_0F6A, // s_bcnt1_i32_b32 s4, vcc_lo
+            0x7E08_0204, // v_mov_b32 v4, s4
+            0xF800_180F,
+            0x0404_0404, // exp mrt0, v4, v4, v4, v4 done vm
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code,
+        };
+        let p = ir::build(&native.code, false, 256).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let lowered = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .unwrap();
+        // Without the per-half pick, nothing reads the lane index here.
+        assert!(
+            lowered
+                .op_names
+                .iter()
+                .any(|n| n == "dx.op.waveGetLaneIndex"),
+            "the mask read should pick the lane's half of the ballot"
+        );
     }
 
     #[test]
