@@ -1349,6 +1349,24 @@ static RESOURCE_FUNCTIONS: Table<32> = {
     Table(f)
 };
 
+#[cfg(all(test, windows))]
+pub(crate) fn test_buffer_at(address: u64, width: u64) -> This {
+    let mut buffer = std::ptr::null();
+    assert_eq!(
+        create_at_address(
+            std::ptr::null(),
+            address,
+            &tests::buffer(width),
+            0,
+            std::ptr::null(),
+            &RESOURCE_IIDS[0],
+            &mut buffer,
+        ),
+        S_OK,
+    );
+    buffer
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1366,7 +1384,7 @@ mod tests {
         visible_nodes: 0,
     };
 
-    fn buffer(width: u64) -> ResourceDesc {
+    pub(super) fn buffer(width: u64) -> ResourceDesc {
         ResourceDesc {
             dimension: BUFFER,
             alignment: 0,

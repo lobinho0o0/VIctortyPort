@@ -403,7 +403,7 @@ impl State {
     /// What draws and dispatches share: heaps, our root signature, the
     /// pipeline, and per stage the user data, root views and the
     /// descriptors its tables hold.
-    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
+    pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -412,8 +412,14 @@ impl State {
                 .heaps
                 .iter()
                 .filter(|&&h| h != 0)
-                .filter_map(|&h| crate::descriptor::heap(h as This).host())
-                .map(|h| Some(h.heap.clone()))
+                .filter_map(|&h| {
+                    let title = crate::descriptor::heap(h as This);
+                    let heap = title.host()?;
+                    if !title.samplers() {
+                        list.use_view_heap(heap);
+                    }
+                    Some(Some(heap.heap.clone()))
+                })
                 .collect();
             heaps.iter().flatten().for_each(|h| list.keep(h));
             // SAFETY: an open list and shader-visible heaps.
