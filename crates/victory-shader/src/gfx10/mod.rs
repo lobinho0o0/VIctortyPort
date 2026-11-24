@@ -152,8 +152,9 @@ fn flow(inst: &Instruction, next: usize, len: usize) -> Result<Flow, ShaderError
 /// Resolves the far jump compilers emit beyond the reach of a branch offset:
 /// `s_getpc_b64 s[n:n+1]`, `s_add_u32|s_sub_u32 sn, sn, literal`, a carry
 /// into s(n+1), `s_setpc_b64 s[n:n+1]`, looking back over the straight-line
-/// run just decoded. Any other `s_setpc_b64` (e.g. a handover to the next
-/// merged stage through registers) gives `None`.
+/// run just decoded. Another write to s[n:n+1] in that run sends the jump
+/// elsewhere, so it is not resolved. Any other `s_setpc_b64` (e.g. a
+/// handover to the next merged stage through registers) gives `None`.
 fn far_jump<'a>(
     before: impl Fn(usize) -> Option<&'a Instruction>,
     setpc: &Instruction,
@@ -183,17 +184,46 @@ fn far_jump<'a>(
             (Encoding::Sop1, Some("s_getpc_b64")) if sdst == n => {
                 let Some(delta) = delta else { break };
                 // s_getpc_b64 yields the address of the instruction after it.
-                return usize::try_from(prev.offset as i64 + 4 + delta)
+                let target = usize::try_from(prev.offset as i64 + 4 + delta)
                     .ok()
                     .filter(|&t| t < len)
-                    .map(Some)
-                    .ok_or(isa(setpc.offset, "far jump target outside the code"));
+                    .ok_or(isa(setpc.offset, "far jump target outside the code"))?;
+                // Instructions are dword aligned; a literal that is not a
+                // multiple of 4 would decode from the middle of a dword.
+                if !target.is_multiple_of(4) {
+                    return Err(isa(setpc.offset, "far jump target is not dword aligned"));
+                }
+                return Ok(Some(target));
             }
+            // The carry into the high dword.
+            (Encoding::Sop2, Some("s_addc_u32" | "s_subb_u32"))
+                if sdst == n + 1 && ssrc0 == n + 1 && delta.is_none() => {}
+            // Anything else that writes the pair (a second add, a move into
+            // the high dword...) jumps somewhere the pattern does not say.
+            _ if writes_pair(prev, n) => break,
             _ => {}
         }
         at = prev.offset;
     }
     Ok(None)
+}
+
+/// Whether `inst` names sn or s(n+1) as a destination. VALU SGPR results
+/// are read as wave64 masks, which only widens the check.
+fn writes_pair(inst: &Instruction, n: u32) -> bool {
+    let dst = match inst.fields(true) {
+        Fields::Sop { dst, .. } => dst.into_iter().collect(),
+        Fields::Smem { data, .. } => data.into_iter().collect(),
+        Fields::Valu(v) => v.dst.into_iter().chain(v.carry).collect(),
+        _ => Vec::new(),
+    };
+    dst.iter().any(|d| match *d {
+        Operand::Scalar { code, dwords } => {
+            let (lo, hi) = (u32::from(code), u32::from(code) + u32::from(dwords));
+            lo <= n + 1 && n < hi
+        }
+        _ => false,
+    })
 }
 
 fn instruction(code: &[u8], offset: usize) -> Result<Instruction, ShaderError> {
@@ -492,5 +522,133 @@ mod tests {
         );
         // s_cbranch_scc0 into the literal of the s_mov_b32 at 4.
         assert!(decode(&bytes(&[sopp(0x04, 1), 0xBE80_03FF, S_ENDPGM, S_ENDPGM])).is_err());
+    }
+
+    /// The offset and reason `decode` refuses `code` with.
+    fn refused(code: &[u32]) -> (usize, &'static str) {
+        match decode(&bytes(code)) {
+            Err(ShaderError::Isa { offset, reason }) => (offset, reason),
+            other => panic!("expected an ISA error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn each_refusal_names_its_reason_and_offset() {
+        assert_eq!(
+            decode(&[0; 6]),
+            Err(isa(6, "code size is not a multiple of 4"))
+        );
+        // s_branch +100 from the end of a one-dword program.
+        assert_eq!(
+            refused(&[sopp(0x02, 100)]),
+            (0, "branch target outside the code")
+        );
+        // s_branch -2 from offset 0: before the start of the code.
+        assert_eq!(
+            refused(&[sopp(0x02, -2), S_ENDPGM]),
+            (0, "branch target outside the code")
+        );
+        // s_call_b64 s[0:1], +100: a call follows the same range check.
+        assert_eq!(
+            refused(&[0xBB00_0064, S_ENDPGM]),
+            (0, "branch target outside the code")
+        );
+        // s_mov_b32 s0, literal with the literal missing, after a full one.
+        assert_eq!(
+            refused(&[0xBE80_03FF, 0, 0xBE80_03FF]),
+            (8, "instruction runs past the end of the code")
+        );
+        // Code that runs off the end without s_endpgm.
+        assert_eq!(
+            refused(&[0x0600_0000]),
+            (4, "instruction runs past the end of the code")
+        );
+        // A VOP3 whose second dword is missing.
+        assert_eq!(
+            refused(&[0xD54B_0000]),
+            (0, "instruction runs past the end of the code")
+        );
+        // An MTBUF reads its second dword for the opcode's high bit.
+        assert_eq!(
+            refused(&[0xE800_0000]),
+            (0, "instruction runs past the end of the code")
+        );
+        // FLAT with segment 3.
+        assert_eq!(
+            refused(&[0xDC00_C000, 0, S_ENDPGM]),
+            (0, "reserved FLAT segment")
+        );
+        assert_eq!(refused(&[0xE400_0000, 0]), (0, "unknown encoding"));
+        // s_cbranch_scc0 into the literal of the s_mov_b32 at 4.
+        assert_eq!(
+            refused(&[sopp(0x04, 1), 0xBE80_03FF, S_ENDPGM, S_ENDPGM]),
+            (8, "a branch lands inside an instruction")
+        );
+    }
+
+    #[test]
+    fn rejects_far_jumps_off_the_code_or_off_a_dword() {
+        // s_getpc_b64 s[8:9]; s_add_u32 s8, s8, lit; s_addc_u32; s_setpc_b64.
+        let jump = |literal: u32| {
+            [
+                0xBE88_1F00,
+                0x8008_FF08,
+                literal,
+                0x8209_8009,
+                0xBE80_2008,
+                S_ENDPGM,
+            ]
+        };
+        assert_eq!(summary(&jump(16)).last(), Some(&(20, 1, "s_endpgm")));
+        assert_eq!(refused(&jump(20)), (16, "far jump target outside the code"));
+        assert_eq!(
+            refused(&jump(0xFFFF_FFF0)),
+            (16, "far jump target outside the code")
+        );
+        for literal in [13, 14, 15, 17] {
+            assert_eq!(
+                refused(&jump(literal)),
+                (16, "far jump target is not dword aligned"),
+                "literal {literal}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_far_jump_whose_registers_change_is_not_resolved() {
+        // s_getpc_b64 s[8:9]; s_add_u32 s8, s8, lit; s_addc_u32 s9, s9, 0;
+        // `between`; s_setpc_b64 s[8:9]; junk; s_endpgm, with the literal
+        // aimed at the s_endpgm. Returns whether the jump was followed.
+        let followed = |between: &[u32]| {
+            let lit = 4 * (5 + between.len() as u32);
+            let mut code = vec![0xBE88_1F00, 0x8008_FF08, lit, 0x8209_8009];
+            code.extend(between);
+            code.extend([0xBE80_2008, 0xFFFF_FFFF, S_ENDPGM]);
+            let found = summary(&code);
+            let end = found.last().unwrap();
+            match end.2 {
+                "s_endpgm" => {
+                    assert_eq!(end.0, 4 + lit as usize);
+                    true
+                }
+                name => {
+                    assert_eq!(name, "s_setpc_b64");
+                    false
+                }
+            }
+        };
+        assert!(followed(&[]));
+        // Writes to other registers leave the jump alone.
+        assert!(followed(&[0xBE8A_0380])); // s_mov_b32 s10, 0
+        assert!(followed(&[0x7E0E_0500])); // v_readfirstlane_b32 s7, v0
+        // Writes to the pair change where it goes: an indirect jump.
+        assert!(!followed(&[0x8008_FF08, 16])); // s_add_u32 s8, s8, 16
+        assert!(!followed(&[0xBE89_0380])); // s_mov_b32 s9, 0
+        assert!(!followed(&[0xBE88_0480])); // s_mov_b64 s[8:9], 0
+        assert!(!followed(&[0xBE87_0480])); // s_mov_b64 s[7:8], 0
+        assert!(!followed(&[0x7E12_0500])); // v_readfirstlane_b32 s9, v0
+        assert!(!followed(&[0xF400_0200, 0xFA00_0000])); // s_load_dword s8, s[0:1], 0
+        // The carry must go into the high dword.
+        assert!(!followed(&[0x8208_8008])); // s_addc_u32 s8, s8, 0
     }
 }

@@ -214,7 +214,13 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                         row: i.row,
                         channel,
                     };
-                    loaded.push((Reg::V(i.vgpr + channel), input));
+                    // The stage data names the first VGPR with a byte; a
+                    // channel past v255 would wrap round onto v0-v2.
+                    let reg = i
+                        .vgpr
+                        .checked_add(channel)
+                        .ok_or(ShaderError::Malformed("vertex attribute past v255"))?;
+                    loaded.push((Reg::V(reg), input));
                 }
             }
             (loaded, &[][..], &outputs[..])
@@ -662,6 +668,44 @@ mod tests {
         assert_eq!(io.exports[0].target, Target::Primitive);
         // The group input is uniform only as the first lane reads it.
         assert!(mesh(&[0x7E02_0305, S_ENDPGM]).is_err()); // v_mov_b32 v1, v5
+    }
+
+    fn vertex(inputs: Vec<crate::native::VsInput>) -> NativeProgram {
+        NativeProgram {
+            stage: HwStage::Vs,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Vs {
+                inputs,
+                outputs: vec![],
+            },
+            code: vec![],
+        }
+    }
+
+    /// An attribute's channels go to consecutive VGPRs from a byte-sized
+    /// base; one that would pass v255 is refused instead of wrapping onto
+    /// the vertex id in v0.
+    #[test]
+    fn vertex_attributes_stay_below_v256() {
+        let p = program(&[S_ENDPGM]);
+        let input = |vgpr, mask| crate::native::VsInput {
+            usage: Usage::Generic,
+            row: 0,
+            mask,
+            vgpr,
+        };
+        assert!(raise(&p, &vertex(vec![input(252, 0xF)])).is_ok());
+        assert!(raise(&p, &vertex(vec![input(255, 0x1)])).is_ok());
+        for (vgpr, mask) in [(253, 0xF), (255, 0x2), (254, 0x8)] {
+            assert_eq!(
+                raise(&p, &vertex(vec![input(vgpr, mask)])),
+                Err(ShaderError::Malformed("vertex attribute past v255")),
+                "v{vgpr} mask {mask:#x}"
+            );
+        }
     }
 
     #[test]

@@ -1965,6 +1965,28 @@ impl<'a> Lower<'a> {
         r
     }
 
+    /// Source `k`, a console lane select, as the hardware takes it: only
+    /// its low 5 (wave32) or 6 (wave64) bits, so lane 35 of a wave32 is
+    /// lane 3. Unmasked, a write to lane 35 would match no lane and a read
+    /// of it would ask the host for a lane past its wave. A constant folds.
+    fn lane_select(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        let m = self.wave() - 1;
+        let constant = match v.src.get(k) {
+            Some(&Operand::Const(c)) => crate::resource::inline(c),
+            Some(&Operand::Literal(x)) => Some(x),
+            _ => None,
+        };
+        if let Some(x) = constant {
+            return Ok(self.s.m.i32(x & m));
+        }
+        let lane = self.src(inst, k)?;
+        let m = self.s.m.i32(m);
+        Ok(self.s.m.bin(self.cur, Bin::And, lane, m))
+    }
+
     fn read_lane(&mut self, x: V, lane: V) -> V {
         self.s.op(
             self.cur,
@@ -3965,20 +3987,24 @@ impl<'a> Lower<'a> {
                 Ok(())
             }
             "v_readlane_b32" => {
-                let (a, lane) = (s(self, 0)?, s(self, 1)?);
+                let a = s(self, 0)?;
                 // A computed lane in a pixel or vertex program is a host lane
                 // (from a mask or `v_mbcnt`); a constant one is the console's.
-                if self.mask_data == MaskData::Host && !matches!(lane, V::Const(_)) {
+                let constant =
+                    matches!(v.src.get(1), Some(Operand::Const(_) | Operand::Literal(_)));
+                let lane = if self.mask_data == MaskData::Host && !constant {
                     self.s.flags |= flags::WAVE_OPS;
+                    s(self, 1)?
                 } else {
                     self.cross_lane(false)?;
-                }
+                    self.lane_select(inst, 1)?
+                };
                 let r = self.read_lane(a, lane);
                 int(self, r)
             }
             "v_writelane_b32" => {
                 // The lane given takes the scalar; the others keep their value.
-                let (a, lane) = (s(self, 0)?, s(self, 1)?);
+                let (a, lane) = (s(self, 0)?, self.lane_select(inst, 1)?);
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a lane write");
                 };
@@ -6567,10 +6593,15 @@ mod tests {
 
     /// Lowers a compute program of constants: whether it translates.
     fn lowers(words: &[u32]) -> Result<(), crate::ShaderError> {
+        dxil(words, false).map(|_| ())
+    }
+
+    /// The DXIL of a compute program of constants.
+    fn dxil(words: &[u32], wave64: bool) -> Result<Vec<u8>, crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let native = NativeProgram {
             stage: HwStage::Cs,
-            wave64: false,
+            wave64,
             vgprs: 256,
             layout: vec![],
             used: vec![],
@@ -6595,7 +6626,35 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
         })
-        .map(|_| ())
+        .map(|l| l.dxil)
+    }
+
+    /// A lane select keeps only the bits the wave has lanes for, as the
+    /// hardware does: lane 35 of a wave32 is lane 3 and lane 64 of a wave64
+    /// is lane 0, so the program is the one naming the low lane, and the
+    /// next lane up is another.
+    #[test]
+    fn a_lane_select_past_the_wave_wraps_as_the_hardware_does() {
+        // src1 is the lane's inline constant (128 + lane, lanes 0 to 64).
+        let program = |write: u32, read: u32| {
+            [
+                0xBE80_0387, // s_mov_b32 s0, 7
+                0xD761_0001,
+                (128 + write) << 9, // v_writelane_b32 v1, s0, write
+                0xD760_0002,
+                (128 + read) << 9 | 0x101, // v_readlane_b32 s2, v1, read
+                0xBF07_8002,               // s_cmp_lg_u32 s2, 0
+                0xBF85_0001,               // s_cbranch_scc1 -> s_endpgm
+                0xBE83_0380,               // s_mov_b32 s3, 0
+                S_ENDPGM,
+            ]
+        };
+        for (wave64, lane, past) in [(false, 3, 35), (true, 0, 64)] {
+            let low = dxil(&program(lane, lane), wave64).unwrap();
+            assert_ne!(dxil(&program(lane + 1, lane), wave64).unwrap(), low);
+            assert_eq!(dxil(&program(past, lane), wave64).unwrap(), low);
+            assert_eq!(dxil(&program(lane, past), wave64).unwrap(), low);
+        }
     }
 
     #[test]

@@ -286,11 +286,12 @@ pub fn emit(
             .iter()
             .enumerate()
             .map(|(n, &w)| {
-                let mut s = StaticSampler::from_words(w);
+                let s = StaticSampler::from_words(w);
                 if l.cmp_samplers >> n & 1 != 0 {
-                    s.filter |= 0x80;
+                    s.comparison()
+                } else {
+                    s
                 }
-                s
             })
             .collect(),
         samplers: l.samplers,
@@ -304,6 +305,16 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
     use crate::dxbc::u32_at;
     let count = u32_at(part, 0)? as usize;
     let base = u32_at(part, 4)? as usize;
+    // Rows are 32 bytes each from `base`; a count the part cannot hold
+    // would otherwise reserve room for up to 2^32 rows (hundreds of gigabytes) before
+    // the first row is read, and the failed allocation aborts the process.
+    if count
+        .checked_mul(32)
+        .and_then(|rows| rows.checked_add(base))
+        .is_none_or(|end| end > part.len())
+    {
+        return Err(ShaderError::Malformed("signature rows out of bounds"));
+    }
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
         let at = base + 32 * i;
@@ -392,7 +403,6 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
 
 #[cfg(test)]
 mod tests {
-    use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
 
@@ -407,9 +417,46 @@ mod tests {
         }
     }
     use super::container::SigElement;
-    use super::shader::Shader;
     use super::*;
     use crate::native::{ComputeIo, StageIo};
+
+    /// An `ISG1`/`OSG1` part whose row count it cannot hold is refused
+    /// before anything is reserved for the rows. A count of 2^32 - 1 asked
+    /// for hundreds of gigabytes up front, and the failed allocation took
+    /// the whole process down.
+    #[test]
+    fn a_signature_row_count_past_the_part_is_refused() {
+        // Header (count, offset of the rows), one 32-byte row, its name.
+        let part = |count: u32, base: u32| {
+            let mut p = Vec::new();
+            for w in [count, base, 0, 40, 0, 0, 3, 1, 0x0F, 0] {
+                p.extend_from_slice(&u32::to_le_bytes(w));
+            }
+            p.extend_from_slice(b"TEXCOORD\0");
+            p
+        };
+        let rows = signature(&part(1, 8)).expect("one row inside the part");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            (rows[0].name.as_str(), rows[0].row, rows[0].cols),
+            ("TEXCOORD", Some(1), 4)
+        );
+        assert!(signature(&part(0, 8)).unwrap().is_empty());
+        let refused = ShaderError::Malformed("signature rows out of bounds");
+        for (count, base) in [
+            (u32::MAX, 8),
+            (0x0800_0000, 8),
+            (2, 8),
+            (1, 30),
+            (1, u32::MAX),
+        ] {
+            assert_eq!(
+                signature(&part(count, base)).unwrap_err().to_string(),
+                refused.to_string(),
+                "count {count:#x}, rows at {base:#x}"
+            );
+        }
+    }
 
     /// A wave64 compute program that writes only EXEC's high dword
     /// (`s_mov_b32 exec_hi, 0`) before a vector instruction. The new mask is
@@ -446,8 +493,13 @@ mod tests {
         }
     }
 
-    /// A pixel shader writing a constant colour.
+    /// A pixel shader writing a constant colour. Every host builds it:
+    /// `constant_color_is_a_well_formed_container` checks it without D3D12,
+    /// and the Windows tests run it through dxil.dll and a device.
     fn constant_color() -> Vec<u8> {
+        use super::bitcode::Attr;
+        use super::shader::Shader;
+
         let mut s = Shader::new(true);
         s.outputs.push(SigElement {
             name: "SV_Target".into(),
@@ -473,6 +525,25 @@ mod tests {
         }
         s.m.terminate(b, super::bitcode::Term::Ret);
         s.finish()
+    }
+
+    /// What D3D12 and the validator check before reading the bitcode, without
+    /// either: the container parses, its size field is its length, its parts
+    /// are the ones a pixel shader carries, and the digest is the one
+    /// `container::hash` gives for the bytes after it.
+    #[test]
+    fn constant_color_is_a_well_formed_container() {
+        let c = constant_color();
+        let parsed = Container::parse(&c).unwrap();
+        assert_eq!(crate::dxbc::u32_at(&c, 0x18).unwrap() as usize, c.len());
+        let fourccs: Vec<_> = parsed.parts.iter().map(|p| p.fourcc.0).collect();
+        assert_eq!(
+            fourccs,
+            [*b"SFI0", *b"ISG1", *b"OSG1", *b"PSV0", *b"HASH", *b"DXIL"]
+        );
+        let dxil = parsed.part(crate::dxbc::FourCC(*b"DXIL")).unwrap();
+        assert_eq!(&dxil.data[8..12], b"DXIL");
+        assert_eq!(parsed.digest, super::container::hash(&c[20..]));
     }
 
     #[test]
