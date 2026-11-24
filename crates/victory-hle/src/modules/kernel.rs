@@ -594,9 +594,11 @@ mod host {
 
 #[cfg(test)]
 mod tests {
+    #[cfg_attr(not(windows), allow(unused_imports))]
     use super::*;
 
     #[test]
+    #[cfg(windows)] // reads its own PE test binary / Windows path rules
     fn title_images_report_their_original_path() {
         let base = 0x7000_0000_0000;
         runtime::set_image_path(base, std::path::Path::new(r"C:\title\game.exe"));
@@ -615,6 +617,7 @@ mod tests {
         assert_eq!(&small, &[b'C', b':', b'\\', 0]);
     }
 
+    #[cfg(windows)]
     fn w(text: &str) -> Vec<u16> {
         text.encode_utf16().chain(Some(0)).collect()
     }
@@ -655,6 +658,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)] // reads its own PE test binary / Windows path rules
     fn title_dlls_and_pseudo_modules_are_found_by_name() {
         let base = 0x7100_0000_0000usize;
         runtime::set_image_path(base, std::path::Path::new(r"C:\title\Mapped.dll"));

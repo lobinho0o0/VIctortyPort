@@ -7,8 +7,13 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
+#[cfg(not(windows))]
+use offhost::{Host, Validator, host};
+use victory_shader::emit;
+#[cfg(windows)]
 use victory_shader::emit::host::{self, Host};
-use victory_shader::emit::{self, validator::Validator};
+#[cfg(windows)]
+use victory_shader::emit::validator::Validator;
 use victory_shader::structure::{self, Atom, LaneExit};
 use victory_shader::{
     Container, FourCC, HwStage, NativeProgram, RootType, ShaderError, ir, native_programs,
@@ -659,4 +664,53 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Off Windows there is neither a D3D12 device nor `dxil.dll`: translation
+/// and structuring run, validation and pipeline creation report themselves
+/// unavailable.
+#[cfg(not(windows))]
+mod offhost {
+    use victory_shader::emit::HostShader;
+
+    const NONE: &str = "needs Windows (D3D12 / dxil.dll)";
+
+    pub struct Validator;
+    impl Validator {
+        pub fn default_path() -> Option<std::path::PathBuf> {
+            None
+        }
+        pub fn load(_: Option<&std::path::Path>) -> Result<Self, String> {
+            Err(NONE.into())
+        }
+        pub fn validate(&mut self, _: &mut [u8]) -> Result<(), String> {
+            Err(NONE.into())
+        }
+    }
+
+    pub struct Host;
+    impl Host {
+        pub fn new(_: bool) -> Result<Self, String> {
+            Err(NONE.into())
+        }
+        pub fn pipeline(&self, _: &HostShader, _: &HostShader) -> Result<(), String> {
+            Err(NONE.into())
+        }
+        pub fn compute_pipeline(&self, _: &HostShader) -> Result<(), String> {
+            Err(NONE.into())
+        }
+        pub fn mesh_pipeline(&self, _: &HostShader, _: &HostShader) -> Result<(), String> {
+            Err(NONE.into())
+        }
+    }
+
+    pub mod host {
+        use victory_shader::emit::HostShader;
+        pub fn stub_ps() -> HostShader {
+            unreachable!("no host off Windows")
+        }
+        pub fn stub_vs(_: &HostShader) -> Result<HostShader, String> {
+            Err(super::NONE.into())
+        }
+    }
 }

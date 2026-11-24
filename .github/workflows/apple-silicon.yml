@@ -1,0 +1,44 @@
+name: Apple Silicon
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apple-silicon-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-arm64:
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify native architecture
+        run: |
+          test "$(uname -m)" = arm64
+          rustc -Vv
+          rustc -Vv | grep 'host: aarch64-apple-darwin'
+
+      - name: Asset policy
+        run: cargo xtask policy
+
+      - name: Check workspace
+        run: cargo check --workspace --locked
+
+      - name: Test workspace
+        run: cargo test --workspace --locked
+
+      - name: Build release executable
+        run: cargo build --workspace --release --locked
+
+      - name: Verify Mach-O ARM64
+        run: file target/release/victory | grep arm64
+
+      - name: Synthetic offline CLI
+        run: bash tests/offline-cli.sh target/release/victory
