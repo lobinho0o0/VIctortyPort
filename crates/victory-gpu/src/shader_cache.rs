@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
-use victory_shader::emit::{HostShader, StaticSampler, UserData};
+use victory_shader::emit::{HostShader, StaticSampler, UserData, WaveRange};
 use victory_shader::{HwStage, RootType};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
@@ -67,12 +67,38 @@ fn build() -> &'static [u8; 32] {
     })
 }
 
+fn host_waves() -> Option<WaveRange> {
+    #[cfg(windows)]
+    {
+        crate::host::host().and_then(|h| h.wave_range)
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+fn cache_key(build: &[u8; 32], waves: Option<WaveRange>) -> [u8; 32] {
+    match waves {
+        None => *build,
+        Some(r) => {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(build);
+            hasher.update(&r.min.to_le_bytes());
+            hasher.update(&r.max.to_le_bytes());
+            *hasher.finalize().as_bytes()
+        }
+    }
+}
+
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let waves = host_waves();
+    let translate =
+        |c: &[u8]| victory_shader::emit::translate_for(c, waves).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, build(), container, translate),
+        Some(cache) => cached(cache, &cache_key(build(), waves), container, translate),
         None => translate(container),
     }
 }

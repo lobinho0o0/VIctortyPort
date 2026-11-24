@@ -386,7 +386,8 @@ fn translate(
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
-                    match emit::emit(&container, &p, &program, &s, &i, &r) {
+                    let host_waves = checks.host.as_ref().and_then(|(h, _)| h.wave_range());
+                    match emit::emit_for(&container, &p, &program, &s, &i, &r, host_waves) {
                         Ok(shader) => {
                             *counter(t, p.stage, 1) += 1;
                             check(shader, t, checks, label);

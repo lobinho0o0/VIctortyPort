@@ -89,6 +89,8 @@ pub mod validator;
 #[cfg(all(test, windows))]
 mod valu_tests;
 mod wave;
+#[cfg(all(test, windows))]
+mod wave_tests;
 
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
@@ -183,9 +185,57 @@ pub struct UserData {
     pub dword: u32,
 }
 
+/// Wave sizes supported by a host GPU (`WaveLaneCountMin..=WaveLaneCountMax`).
+///
+/// Used to pick a host-supported wave size for small Wave64 compute thread
+/// groups (`threads <= host_wave`) without hard-coding Wave32 (which would
+/// break Wave64-only GPUs such as AMD GCN/Vega).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WaveRange {
+    pub min: u32,
+    pub max: u32,
+}
+
+impl WaveRange {
+    /// Picks the wave size to declare for a compute group of `threads` lanes
+    /// compiled for `console_wave` (32 or 64).
+    ///
+    /// Keeps `console_wave` when supported by the host; otherwise picks the
+    /// smallest supported power-of-two wave size that still holds the whole
+    /// group (`threads <= w < console_wave`), falling back to `console_wave`
+    /// when no smaller supported wave fits.
+    pub fn choose(self, console_wave: u32, threads: u32) -> u32 {
+        if self.supports(console_wave) {
+            return console_wave;
+        }
+        let mut w = self.min.max(4).next_power_of_two();
+        while w <= self.max && w < console_wave {
+            if threads <= w {
+                return w;
+            }
+            w <<= 1;
+        }
+        console_wave
+    }
+
+    fn supports(self, wave: u32) -> bool {
+        wave.is_power_of_two() && self.min <= wave && wave <= self.max
+    }
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
-/// shader container.
+/// shader container (falling back to the console's wave size).
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    translate_for(container, None)
+}
+
+/// Translates the vertex, pixel, compute or mesh program of a console
+/// shader container for a host with supported wave sizes `host_waves`
+/// (`None` falls back to the console's wave size).
+pub fn translate_for(
+    container: &[u8],
+    host_waves: Option<WaveRange>,
+) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -206,10 +256,11 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let res = resource::track(&p, &native.layout, native.stage)?;
     let io = io::raise(&p, &native)?;
     let st = structure::structure(&p)?;
-    emit(&c, &native, &p, &st, &io, &res)
+    emit_for(&c, &native, &p, &st, &io, &res, host_waves)
 }
 
-/// Emits a program whose earlier stages already ran.
+/// Emits a program whose earlier stages already ran (falling back to the
+/// console's wave size).
 pub fn emit(
     c: &Container,
     native: &NativeProgram,
@@ -217,6 +268,20 @@ pub fn emit(
     st: &structure::Structured,
     io: &io::Io,
     res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    emit_for(c, native, p, st, io, res, None)
+}
+
+/// Emits a program whose earlier stages already ran for a host with
+/// supported wave sizes `host_waves`.
+pub fn emit_for(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    host_waves: Option<WaveRange>,
 ) -> Result<HostShader, ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
@@ -276,6 +341,7 @@ pub fn emit(
         outputs,
         prims,
         mesh_stride,
+        host_waves,
     })?;
     Ok(HostShader {
         stage: native.stage,
@@ -524,6 +590,33 @@ mod tests {
                 "digest {digest:02x?} accepted"
             );
         }
+    }
+
+    #[test]
+    fn wave_range_matches_device_capabilities() {
+        use super::WaveRange;
+        // Wave64-only (e.g. AMD GCN / Vega): never hard-code 32.
+        let gcn = WaveRange { min: 64, max: 64 };
+        assert_eq!(gcn.choose(64, 32), 64);
+        assert_eq!(gcn.choose(64, 64), 64);
+        // Dual-wave (e.g. AMD RDNA): keep console wave size.
+        let rdna = WaveRange { min: 32, max: 64 };
+        assert_eq!(rdna.choose(64, 32), 64);
+        assert_eq!(rdna.choose(32, 32), 32);
+        // Wave32-only (e.g. NVIDIA): narrow small Wave64 groups to 32; keep 64 if > 32 threads.
+        let nv = WaveRange { min: 32, max: 32 };
+        assert_eq!(nv.choose(64, 32), 32);
+        assert_eq!(nv.choose(64, 16), 32);
+        assert_eq!(nv.choose(64, 64), 64);
+        // Intel Arc (16..=32): pick smallest supported wave holding the group.
+        let arc = WaveRange { min: 16, max: 32 };
+        assert_eq!(arc.choose(64, 16), 16);
+        assert_eq!(arc.choose(64, 32), 32);
+        assert_eq!(arc.choose(64, 64), 64);
+        // WARP (4..=8): holds <= 8 threads in 8; falls back to 64 for 32 threads.
+        let warp = WaveRange { min: 4, max: 8 };
+        assert_eq!(warp.choose(64, 8), 8);
+        assert_eq!(warp.choose(64, 32), 64);
     }
 
     #[test]

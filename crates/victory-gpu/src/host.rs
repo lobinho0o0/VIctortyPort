@@ -37,6 +37,8 @@ const RTV_RING: u32 = 1024;
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
+    /// Wave sizes reported by `D3D12_FEATURE_D3D12_OPTIONS1` (`None` if unavailable).
+    pub(crate) wave_range: Option<victory_shader::emit::WaveRange>,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -207,9 +209,25 @@ fn create() -> windows::core::Result<Host> {
                 ..Default::default()
             })?;
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
-        tracing::info!("host D3D12 device ready");
+        let mut opt1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        let wave_range = (device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut opt1).cast(),
+                size_of_val(&opt1) as u32,
+            )
+            .is_ok()
+            && opt1.WaveOps.as_bool()
+            && opt1.WaveLaneCountMin > 0
+            && opt1.WaveLaneCountMin <= opt1.WaveLaneCountMax)
+            .then_some(victory_shader::emit::WaveRange {
+                min: opt1.WaveLaneCountMin,
+                max: opt1.WaveLaneCountMax,
+            });
+        tracing::info!(?wave_range, "host D3D12 device ready");
         Ok(Host {
             device,
+            wave_range,
             queue,
             fence,
             submitted: Mutex::new(0),
@@ -249,7 +267,7 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 }
 
 #[cfg(test)]
-mod tests {
+mod warp_tests {
     use super::*;
 
     #[test]

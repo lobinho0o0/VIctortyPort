@@ -98,6 +98,25 @@ impl Host {
         }
     }
 
+    /// Wave sizes the host device reports via `D3D12_FEATURE_D3D12_OPTIONS1`,
+    /// or `None` when wave operations are unavailable or the query fails.
+    pub fn wave_range(&self) -> Option<super::WaveRange> {
+        let mut opt = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: plain D3D12 feature query with valid out pointer.
+        let ok = unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut opt).cast(),
+                size_of_val(&opt) as u32,
+            )
+        };
+        (ok.is_ok() && opt.WaveOps.as_bool() && opt.WaveLaneCountMin > 0 && opt.WaveLaneCountMin <= opt.WaveLaneCountMax)
+            .then_some(super::WaveRange {
+                min: opt.WaveLaneCountMin,
+                max: opt.WaveLaneCountMax,
+            })
+    }
+
     /// The root signature translated shaders expect: user data per stage
     /// at `b0`, immediate samplers per stage at `s<n>`, heaps directly
     /// indexed.
