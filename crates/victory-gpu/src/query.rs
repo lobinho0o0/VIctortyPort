@@ -492,6 +492,53 @@ mod tests {
         }
     }
 
+    /// A title draw the host does not run (here: no pipeline bound) inside
+    /// an occlusion query leaves it uncounted, so the query keeps its
+    /// stand-in result instead of hiding what the draw would have shown.
+    /// Statistics keep what the host counted.
+    #[cfg(windows)]
+    #[test]
+    fn occlusion_queries_around_draws_not_run_stay_visible() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let triangle = Triangle::new();
+        let (queue, allocator, list) = list();
+        let (occlusion, statistics) = (heap(OCCLUSION_HEAP, 4), heap(PIPELINE_STATISTICS_HEAP, 1));
+        let (buffer, data) = buffer(256);
+        let (begin, end) = (slot::<Mark>(list, BEGIN), slot::<Mark>(list, END));
+        let resolve = slot::<Resolve>(list, RESOLVE);
+        // `DrawInstanced` with nothing bound: recorded, not run.
+        let title_draw = || slot::<extern "system" fn(This, u32, u32, u32, u32)>(list, 0x60)(list, 3, 1, 0, 0);
+        // 0, 1: a cut-away host draw and a title draw not run. 2: the
+        // cut-away draw alone, begun after the title draw.
+        for (index, kind, missed) in [(0, OCCLUSION, true), (1, BINARY_OCCLUSION, true), (2, OCCLUSION, false)] {
+            begin(list, occlusion, kind, index);
+            triangle.draw(list, false);
+            if missed {
+                title_draw();
+            }
+            end(list, occlusion, kind, index);
+        }
+        begin(list, statistics, PIPELINE_STATISTICS, 0);
+        triangle.draw(list, true);
+        title_draw();
+        end(list, statistics, PIPELINE_STATISTICS, 0);
+        resolve(list, occlusion, OCCLUSION, 0, 1, buffer, 0);
+        resolve(list, occlusion, BINARY_OCCLUSION, 1, 1, buffer, 8);
+        resolve(list, occlusion, OCCLUSION, 2, 1, buffer, 16);
+        resolve(list, statistics, PIPELINE_STATISTICS, 0, 1, buffer, 64);
+        run(queue, list);
+
+        assert_eq!(read(data, 0), 1 << 20, "stand-in samples");
+        assert_eq!(read(data, 1), 1, "stand-in visible");
+        assert_eq!(read(data, 2), 0, "measured: nothing passed");
+        assert_eq!((read(data, 8), read(data, 9)), (3, 1), "measured statistics");
+        for object in [buffer, statistics, occlusion, list, allocator, queue] {
+            release(object);
+        }
+    }
+
     /// Host timestamps come out on the title's GPU clock, in order, within
     /// the submission.
     #[cfg(windows)]

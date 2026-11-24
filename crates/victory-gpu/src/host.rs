@@ -296,8 +296,9 @@ pub(crate) struct HostList {
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
-    /// Queries begun in the list and not ended yet: host heap, type, index.
-    queries: Mutex<Vec<(ID3D12QueryHeap, D3D12_QUERY_TYPE, u32)>>,
+    /// Queries begun in the list and not ended yet: host heap, type, index,
+    /// and whether a draw since was not run on the host (`missed_draw`).
+    queries: Mutex<Vec<(ID3D12QueryHeap, D3D12_QUERY_TYPE, u32, bool)>>,
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
@@ -915,7 +916,7 @@ impl HostList {
     pub(crate) fn close(&self) {
         // The host closes no list with queries running; their title ends,
         // in a later list, are dropped (`end_query`).
-        for (heap, kind, index) in self.queries.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
+        for (heap, kind, index, _) in self.queries.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
             // SAFETY: an open list and a query begun in it.
             unsafe { self.list.EndQuery(&heap, kind, index) };
         }
@@ -1065,13 +1066,13 @@ impl HostList {
     /// began.
     pub(crate) fn begin_query(&self, heap: &ID3D12QueryHeap, kind: u32, index: u32) -> bool {
         let mut queries = self.queries.lock().unwrap_or_else(|e| e.into_inner());
-        if kind == crate::query::TIMESTAMP || queries.iter().any(|(h, _, i)| h == heap && *i == index) {
+        if kind == crate::query::TIMESTAMP || queries.iter().any(|(h, _, i, _)| h == heap && *i == index) {
             return false;
         }
         let kind = D3D12_QUERY_TYPE(kind as i32);
         // SAFETY: an open list and a live heap, kept until the list is reset.
         unsafe { self.list.BeginQuery(heap, kind, index) };
-        queries.push((heap.clone(), kind, index));
+        queries.push((heap.clone(), kind, index, false));
         drop(queries);
         self.keep(heap);
         true
@@ -1079,19 +1080,32 @@ impl HostList {
 
     /// Ends query `index` of `heap`: a timestamp is taken; another query
     /// ends only if it began in this list, as the type it began as. The
-    /// type it ended as, if it did.
+    /// type it ended as, if it did and its result is the host's to give: an
+    /// occlusion query with a draw inside that the host did not run counts
+    /// too few samples, and a title would cull by it what the draw shows.
     pub(crate) fn end_query(&self, heap: &ID3D12QueryHeap, kind: u32, index: u32) -> Option<u32> {
-        let kind = if kind == crate::query::TIMESTAMP {
-            D3D12_QUERY_TYPE(kind as i32)
+        let (kind, missed) = if kind == crate::query::TIMESTAMP {
+            (D3D12_QUERY_TYPE(kind as i32), false)
         } else {
             let mut queries = self.queries.lock().unwrap_or_else(|e| e.into_inner());
-            let at = queries.iter().position(|(h, _, i)| h == heap && *i == index)?;
-            queries.swap_remove(at).1
+            let at = queries.iter().position(|(h, _, i, _)| h == heap && *i == index)?;
+            let (_, kind, _, missed) = queries.swap_remove(at);
+            (kind, missed)
         };
         // SAFETY: an open list and a live heap, kept until the list is reset.
         unsafe { self.list.EndQuery(heap, kind, index) };
         self.keep(heap);
-        Some(kind.0 as u32)
+        let occlusion = matches!(kind.0 as u32, crate::query::OCCLUSION | crate::query::BINARY_OCCLUSION);
+        (!(missed && occlusion)).then_some(kind.0 as u32)
+    }
+
+    /// A draw the title recorded was not run on the host (no pipeline yet,
+    /// a shader that does not translate, ...): the queries running around
+    /// it did not see it.
+    pub(crate) fn missed_draw(&self) {
+        for q in self.queries.lock().unwrap_or_else(|e| e.into_inner()).iter_mut() {
+            q.3 = true;
+        }
     }
 
     /// Notes a pipeline the list binds.
