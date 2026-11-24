@@ -750,7 +750,10 @@ pub fn pending_with(
     identity: *const c_void,
     work: impl FnOnce() -> Result<Vec<u8>, HRESULT> + Send + 'static,
 ) -> HRESULT {
-    type Data = Mutex<(Option<Box<dyn FnOnce() -> Result<Vec<u8>, HRESULT> + Send>>, Vec<u8>)>;
+    type Data = Mutex<(
+        Option<Box<dyn FnOnce() -> Result<Vec<u8>, HRESULT> + Send>>,
+        Vec<u8>,
+    )>;
     extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
         // SAFETY: the runtime passes valid provider data; the context is the
         // boxed state until cleanup frees it.
@@ -761,7 +764,11 @@ pub fn pending_with(
             OP_CLEANUP => drop(unsafe { Box::from_raw(state) }),
             OP_BEGIN => {
                 // SAFETY: as above; cleanup waits for completion.
-                let work = unsafe { &*state }.lock().unwrap_or_else(|e| e.into_inner()).0.take();
+                let work = unsafe { &*state }
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0
+                    .take();
                 let (block, state) = (data.block as usize, state as usize);
                 std::thread::spawn(move || {
                     let result = work.map_or(Err(E_ABORT), |work| work());
@@ -790,7 +797,13 @@ pub fn pending_with(
     }
     let state: Box<Data> = Box::new(Mutex::new((Some(Box::new(work)), Vec::new())));
     let context = Box::into_raw(state);
-    let hr = XAsyncBegin(block, context.cast(), identity, std::ptr::null(), Some(provider));
+    let hr = XAsyncBegin(
+        block,
+        context.cast(),
+        identity,
+        std::ptr::null(),
+        Some(provider),
+    );
     if hr < 0 {
         // SAFETY: refused before the call existed; still ours.
         drop(unsafe { Box::from_raw(context) });

@@ -74,20 +74,28 @@ extern "system" fn launch_new_game(
     args: *const c_char,
     _user: *const c_void,
 ) {
-    let (exe, args) = (text(exe).unwrap_or_default(), text(args).unwrap_or_default());
+    let (exe, args) = (
+        text(exe).unwrap_or_default(),
+        text(args).unwrap_or_default(),
+    );
     tracing::info!(exe, args, "XLaunchNewGame");
     let current = runtime::main_image()
         .and_then(runtime::image_path)
         .unwrap_or_default();
     let ours: Vec<_> = std::env::args_os().skip(1).collect();
     let command = relaunch_args(ours, current.as_os_str(), &exe, &args);
-    super::lifecycle::end_title(
-        "XLaunchNewGame",
-        Box::new(move || super::lifecycle::relaunch(command)),
-    );
-    loop {
-        std::thread::park();
+    #[cfg(windows)]
+    {
+        super::lifecycle::end_title(
+            "XLaunchNewGame",
+            Box::new(move || super::lifecycle::relaunch(command)),
+        );
+        loop {
+            std::thread::park();
+        }
     }
+    #[cfg(not(windows))]
+    let _ = command;
 }
 
 /// Our own arguments for the relaunch: the title's executable replaced by
@@ -195,15 +203,32 @@ mod tests {
 
     #[test]
     fn a_relaunch_keeps_our_options() {
-        let ours: Vec<std::ffi::OsString> =
-            ["run", "G:/game.exe", "--execute", "--console", "series-s", "--", "-old"]
-                .map(Into::into)
-                .into();
+        let ours: Vec<std::ffi::OsString> = [
+            "run",
+            "G:/game.exe",
+            "--execute",
+            "--console",
+            "series-s",
+            "--",
+            "-old",
+        ]
+        .map(Into::into)
+        .into();
         let current = std::ffi::OsStr::new("G:/game.exe");
         let again = relaunch_args(ours.clone(), current, "G:/game.exe", " -config=x  -y ");
-        let expected = ["run", "G:/game.exe", "--execute", "--console", "series-s", "--"];
+        let expected = [
+            "run",
+            "G:/game.exe",
+            "--execute",
+            "--console",
+            "series-s",
+            "--",
+        ];
         assert_eq!(again[..6], expected.map(std::ffi::OsString::from));
-        assert_eq!(again[6..], ["-config=x", "-y"].map(std::ffi::OsString::from));
+        assert_eq!(
+            again[6..],
+            ["-config=x", "-y"].map(std::ffi::OsString::from)
+        );
         let other = relaunch_args(ours, current, "G:/other.exe", "");
         assert_eq!(other.len(), 5);
         assert_eq!(other[1], "G:/other.exe");

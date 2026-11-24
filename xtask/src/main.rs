@@ -1,11 +1,11 @@
 //! Repository maintenance. Run with `cargo xtask <command>`.
 
 mod policy;
+mod setup;
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -26,6 +26,8 @@ enum Cmd {
     },
     /// Point git at .githooks/ so every commit runs the policy check.
     InstallHooks,
+    /// One-time local setup: install hooks and create victory.toml.
+    Setup,
 }
 
 fn main() -> Result<()> {
@@ -33,18 +35,11 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Cmd::Policy { staged } => policy::run(&root, staged),
         Cmd::InstallHooks => {
-            let status = Command::new("git")
-                .args(["config", "core.hooksPath", ".githooks"])
-                .current_dir(&root)
-                .status()
-                .context("running git")?;
-            anyhow::ensure!(
-                status.success(),
-                "git config failed (is this a git repository?)"
-            );
+            setup::install_hooks(&root)?;
             println!("hooks installed: commits now run `cargo xtask policy --staged`");
             Ok(())
         }
+        Cmd::Setup => setup::run(&root),
     }
 }
 

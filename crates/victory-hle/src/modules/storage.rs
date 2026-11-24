@@ -175,6 +175,7 @@ mod tests {
     #[test]
     fn serves_a_drive_over_the_title_folder_and_its_quota() {
         type Size = extern "system" fn(This, *mut usize) -> HRESULT;
+        #[cfg(windows)]
         type Get = extern "system" fn(This, usize, *mut u8, *mut usize) -> HRESULT;
         type Space = extern "system" fn(This, *mut SpaceInfo) -> HRESULT;
         type Prompt = extern "system" fn(This, u64, *mut AsyncBlock) -> HRESULT;
@@ -190,23 +191,34 @@ mod tests {
         });
 
         // The path is a drive root, never the host folder.
-        let mut size = 0;
-        assert_eq!(method::<Size>(&OBJECT, 0x18)(this, &mut size), S_OK);
-        assert_eq!(size, 4, "X:\\ and its NUL");
-        let (mut buffer, mut used) = ([0u8; 4], 0);
-        let get = method::<Get>(&OBJECT, 0x20);
-        assert_eq!(get(this, 4, buffer.as_mut_ptr(), &mut used), S_OK);
-        let drive = std::str::from_utf8(&buffer[..3]).unwrap();
-        assert!(drive.ends_with(":\\"), "{drive}");
-        // Title file calls on it reach the folder.
-        let path = format!("{drive}save.dat\0");
-        let mut attributes = [0u8; 36];
-        let get_attributes = super::super::files::GetFileAttributesExW;
-        let wide: Vec<u16> = path.encode_utf16().collect();
-        assert_ne!(
-            get_attributes(wide.as_ptr(), 0, attributes.as_mut_ptr().cast()),
-            0
-        );
+        #[cfg(windows)]
+        {
+            let mut size = 0;
+            assert_eq!(method::<Size>(&OBJECT, 0x18)(this, &mut size), S_OK);
+            assert_eq!(size, 4, "X:\\ and its NUL");
+            let (mut buffer, mut used) = ([0u8; 4], 0);
+            let get = method::<Get>(&OBJECT, 0x20);
+            assert_eq!(get(this, 4, buffer.as_mut_ptr(), &mut used), S_OK);
+            let drive = std::str::from_utf8(&buffer[..3]).unwrap();
+            assert!(drive.ends_with(":\\"), "{drive}");
+            // Title file calls on it reach the folder.
+            let path = format!("{drive}save.dat\0");
+            let mut attributes = [0u8; 36];
+            let get_attributes = super::super::files::GetFileAttributesExW;
+            let wide: Vec<u16> = path.encode_utf16().collect();
+            assert_ne!(
+                get_attributes(wide.as_ptr(), 0, attributes.as_mut_ptr().cast()),
+                0
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            let mut size = 0;
+            assert_eq!(
+                method::<Size>(&OBJECT, 0x18)(this, &mut size),
+                NOT_SUPPORTED
+            );
+        }
 
         let mut info = SpaceInfo {
             available_free: 0,

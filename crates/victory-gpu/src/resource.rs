@@ -279,6 +279,7 @@ pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 /// The format a view of a title texture must name when its host copy is
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
 /// the host copy is typed.
+#[cfg(windows)]
 pub(crate) fn view_format(this: This) -> Option<u32> {
     let own = pc_format(resource(this).desc.format);
     let host = host_resource(this)?;
@@ -867,7 +868,10 @@ fn host_texture(
     }
     if let Some(t) = &texture {
         crate::host::name(t, || {
-            format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
+            format!(
+                "texture {}x{} f{} flags {:#x}",
+                d.width, d.height, d.format, d.flags
+            )
         });
     }
     texture

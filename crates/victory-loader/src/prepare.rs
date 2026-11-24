@@ -173,7 +173,8 @@ fn write(bytes: &mut [u8], at: usize, v: &[u8]) -> Result<(), PrepareError> {
     Ok(())
 }
 
-#[cfg(test)]
+// These tests use the test executable itself as a PE image.
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
 
