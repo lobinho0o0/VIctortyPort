@@ -8,9 +8,12 @@
 //! exception too), is reported from the unhandled-exception filter
 //! (`report_unhandled`, which the runtime calls ahead of the title's own)
 //! and appended to the crash log, with the title's last debug output, which
-//! often states the reason. Panics of ours go to the crash log too.
+//! often states the reason. Diagnostics builds can also append first-chance
+//! breakpoints with `VICTORY_CRASH_BREAKPOINTS=1`. Panics of ours go to the
+//! crash log too.
 
 use std::ptr::null_mut;
+use std::sync::atomic::{AtomicBool, Ordering};
 use windows_sys::Win32::Foundation::{
     EXCEPTION_ACCESS_VIOLATION, EXCEPTION_BREAKPOINT, EXCEPTION_ILLEGAL_INSTRUCTION,
     EXCEPTION_INT_DIVIDE_BY_ZERO, EXCEPTION_PRIV_INSTRUCTION, EXCEPTION_STACK_OVERFLOW, HMODULE,
@@ -45,17 +48,21 @@ pub fn save_on_crash(ranges: Vec<(usize, usize, std::path::PathBuf)>) {
 /// The file crash reports are appended to, besides being printed.
 static LOG: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
+/// Read before installing the exception handler.
+static LOG_FIRST_CHANCE_BREAKPOINTS: AtomicBool = AtomicBool::new(false);
+
 /// Also appends every unhandled-exception report and panic to `file`, so a
 /// crash can be read after the console is gone.
 pub fn log_crashes_to(file: std::path::PathBuf) {
     if LOG.set(file).is_ok() {
+        let _ = HOST.set(host());
         let print = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             print(info);
             append_to_log(&format!(
                 "VIctory: panic on thread {:?}: {info}\n{}",
                 std::thread::current().name().unwrap_or("?"),
-                title_output()
+                report_end()
             ));
         }));
     }
@@ -65,7 +72,7 @@ pub fn log_crashes_to(file: std::path::PathBuf) {
 /// log, with the title's last debug output, and prints it.
 pub fn log_crash(text: &str) {
     let text = format!("{text}
-{}", title_output());
+{}", report_end());
     eprint!("{text}");
     append_to_log(&text);
 }
@@ -108,6 +115,57 @@ fn title_output() -> String {
     said.iter().map(|l| format!("  title said: {l}\n")).collect()
 }
 
+/// The host's line in a crash report. Its CPU and Windows build decide what
+/// title code runs (Intel CPUs lack some of the console's AMD-only
+/// instructions) and which D3D12 runtime there is, so a report needs both.
+/// Set along with the crash log, so a crash queries nothing.
+static HOST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// What ends a crash report: the host, then the title's last debug output.
+fn report_end() -> String {
+    let host = HOST.get().map_or("", String::as_str);
+    format!("{host}{}", title_output())
+}
+
+/// The line [`HOST`] holds.
+fn host() -> String {
+    format!("  host: {}, Windows {}\n", cpu_name(), windows_version())
+}
+
+/// The CPU's brand string, e.g. `AMD Ryzen 7 5700X3D 8-Core Processor`.
+fn cpu_name() -> String {
+    use std::arch::x86_64::__cpuid;
+    if __cpuid(0x8000_0000).eax < 0x8000_0004 {
+        return "an unnamed CPU".into();
+    }
+    let bytes: Vec<u8> = (0x8000_0002..=0x8000_0004)
+        .flat_map(|leaf| {
+            let r = __cpuid(leaf);
+            [r.eax, r.ebx, r.ecx, r.edx]
+        })
+        .flat_map(u32::to_le_bytes)
+        .collect();
+    let padding = |c: char| c == '\0' || c.is_whitespace();
+    let name = String::from_utf8_lossy(&bytes);
+    name.trim_matches(padding).to_owned()
+}
+
+/// The running Windows as `major.minor.build`. `RtlGetVersion` gives the
+/// real one; `GetVersionEx` gives what the executable's manifest declares.
+fn windows_version() -> String {
+    use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
+    use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
+    // SAFETY: a zeroed OSVERSIONINFOW is valid; its size field is set.
+    let mut info: OSVERSIONINFOW = unsafe { std::mem::zeroed() };
+    info.dwOSVersionInfoSize = size_of::<OSVERSIONINFOW>() as u32;
+    // SAFETY: fills the structure passed, whose size it was told.
+    if unsafe { RtlGetVersion(&mut info) } != 0 {
+        return "of unknown version".into();
+    }
+    let (major, minor, build) = (info.dwMajorVersion, info.dwMinorVersion, info.dwBuildNumber);
+    format!("{major}.{minor}.{build}")
+}
+
 /// Installs the handlers; call once before running title code.
 pub fn report_crashes() {
     unsafe extern "system" fn filter(info: *const EXCEPTION_POINTERS) -> i32 {
@@ -115,6 +173,11 @@ pub fn report_crashes() {
         unsafe { report_unhandled(info) };
         EXCEPTION_CONTINUE_SEARCH
     }
+    LOG_FIRST_CHANCE_BREAKPOINTS.store(
+        cfg!(feature = "diagnostics")
+            && std::env::var_os("VICTORY_CRASH_BREAKPOINTS").is_some_and(|value| value == "1"),
+        Ordering::Relaxed,
+    );
     // SAFETY: registers handlers that only read the exception they are
     // given; the title's own filter, once it sets one, takes the place of
     // ours and calls `report_unhandled` first.
@@ -362,9 +425,12 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
     }
     // SAFETY: as above.
-    if FATAL.contains(&unsafe { (*(*info).ExceptionRecord).ExceptionCode }) {
+    let code = unsafe { (*(*info).ExceptionRecord).ExceptionCode };
+    if FATAL.contains(&code) {
+        let to_file =
+            code == EXCEPTION_BREAKPOINT && LOG_FIRST_CHANCE_BREAKPOINTS.load(Ordering::Relaxed);
         // SAFETY: as above.
-        unsafe { report("first-chance exception", info, false) };
+        unsafe { report("first-chance exception", info, to_file) };
     }
     EXCEPTION_CONTINUE_SEARCH
 }
@@ -377,6 +443,22 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
 pub unsafe fn report_unhandled(info: *const EXCEPTION_POINTERS) {
     // SAFETY: forwarded from the caller.
     unsafe { report("unhandled exception", info, true) };
+}
+
+/// The bytes at `at` as hex, as many as the longest x86 instruction (15),
+/// but none past the end of `at`'s page: the next page may not be mapped.
+/// For an instruction the CPU refused, they name it (`0f 01 fd` is
+/// `rdpru`), which the address alone does not.
+///
+/// # Safety
+/// `at`'s page is readable.
+unsafe fn instruction_bytes(at: usize) -> String {
+    let n = (0x1000 - (at & 0xfff)).min(15);
+    // SAFETY: `n` bytes from `at` stay inside its page, which the caller
+    // says is readable.
+    let bytes = unsafe { std::slice::from_raw_parts(at as *const u8, n) };
+    let hex: Vec<_> = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    hex.join(" ")
 }
 
 /// MSVC's code for a C++ `throw`, and its magic first parameter.
@@ -436,10 +518,13 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
             1 => "write",
             _ => "execute",
         };
-        format!(" ({kind} {:#x})", p[1])
+        format!(" ({kind} {:#x}: {})", p[1], memory_at(p[1]))
     } else if code == CPP_EXCEPTION && record.NumberParameters >= 4 && p[0] == CPP_MAGIC {
         // SAFETY: a live MSVC throw.
         format!(" (C++ {} thrown)", unsafe { thrown(&p) })
+    } else if code == EXCEPTION_ILLEGAL_INSTRUCTION || code == EXCEPTION_PRIV_INSTRUCTION {
+        // SAFETY: the CPU refused the instruction at `at`, so it fetched it.
+        format!(" (code {})", unsafe { instruction_bytes(at) })
     } else {
         String::new()
     };
@@ -482,9 +567,9 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
         line(format!("  #{i:<2} {}", locate(pc as usize)));
     }
     if to_file {
-        let said = title_output();
-        eprint!("{said}");
-        text.push_str(&said);
+        let end = report_end();
+        eprint!("{end}");
+        text.push_str(&end);
         append_to_log(&text);
     }
     #[cfg(feature = "diagnostics")]
@@ -579,6 +664,48 @@ fn module_of(address: usize) -> Option<String> {
     Some(format!("{name}+{:#x}", address - module as usize))
 }
 
+/// What is at `address`, for an access violation there: nothing, memory
+/// reserved but never committed, a guard page, or the protection the access
+/// broke (with the module, for an image's pages). Each points at a different
+/// cause: a wild pointer, an allocation whose commit failed, a stack
+/// overrun, a write to code or constants.
+fn memory_at(address: usize) -> String {
+    use windows_sys::Win32::System::Memory::{
+        MEM_FREE, MEM_IMAGE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE,
+        PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD,
+        PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY, VirtualQuery,
+    };
+    // SAFETY: a zeroed MEMORY_BASIC_INFORMATION is valid.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: reads the address space's bookkeeping, not `address` itself.
+    let n = unsafe { VirtualQuery(address as *const _, &mut info, size_of_val(&info)) };
+    if n == 0 {
+        // Above the process's address space: Windows reports a
+        // non-canonical address as all ones.
+        return "outside the address space".into();
+    }
+    let protect = match info.State {
+        MEM_FREE => return "nothing mapped there".into(),
+        MEM_RESERVE => return "reserved, never committed".into(),
+        _ if info.Protect & PAGE_GUARD != 0 => return "a guard page".into(),
+        _ => match info.Protect & 0xff {
+            PAGE_NOACCESS => "no access".into(),
+            PAGE_READONLY => "read-only".into(),
+            PAGE_READWRITE => "read-write".into(),
+            PAGE_WRITECOPY => "copy-on-write".into(),
+            PAGE_EXECUTE => "execute-only".into(),
+            PAGE_EXECUTE_READ => "read-execute".into(),
+            PAGE_EXECUTE_READWRITE => "read-write-execute".into(),
+            PAGE_EXECUTE_WRITECOPY => "copy-on-write, executable".into(),
+            _ => format!("protection {:#x}", info.Protect),
+        },
+    };
+    match module_of(address) {
+        Some(module) if info.Type == MEM_IMAGE => format!("{protect}, in {module}"),
+        _ => protect,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -605,6 +732,41 @@ mod tests {
             .collect();
         let system: Vec<_> = walked[1..].iter().map(|&f| f as usize).collect();
         assert_eq!(ours, system);
+    }
+
+    #[test]
+    fn memory_at_names_what_an_access_hit() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_GUARD, PAGE_NOACCESS, PAGE_READONLY,
+            PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        // SAFETY: reserves four pages of ours and commits three of them;
+        // nothing reads or writes them.
+        let base = unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 0x4000, MEM_RESERVE, PAGE_NOACCESS);
+            assert!(!base.is_null());
+            let page = |i: usize, protect| {
+                let at = base.cast::<u8>().add(i * 0x1000).cast();
+                assert!(!VirtualAlloc(at, 0x1000, MEM_COMMIT, protect).is_null());
+            };
+            page(1, PAGE_READONLY);
+            page(2, PAGE_READWRITE | PAGE_GUARD);
+            page(3, PAGE_NOACCESS);
+            base as usize
+        };
+        assert_eq!(memory_at(base + 8), "reserved, never committed");
+        assert_eq!(memory_at(base + 0x1008), "read-only");
+        assert_eq!(memory_at(base + 0x2008), "a guard page");
+        assert_eq!(memory_at(base + 0x3008), "no access");
+        // SAFETY: releases the reservation made above.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+        assert_eq!(memory_at(base + 8), "nothing mapped there");
+        assert_eq!(memory_at(0), "nothing mapped there");
+        assert_eq!(memory_at(usize::MAX), "outside the address space");
+        // This test's own code: an image page, named by its module.
+        let code = memory_at(memory_at_names_what_an_access_hit as *const () as usize);
+        let named = code.starts_with("read-execute, in victory_loader-");
+        assert!(named, "{code}");
     }
 
     /// On an Intel CPU, the real instructions go through the vectored
@@ -665,6 +827,21 @@ mod tests {
         assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0x38])), None); // clflushopt, /7
         assert_eq!(clwb_len(pad(&[0x0f, 0xae, 0x30])), None); // xsaveopt, no 66
         assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0xf0])), None); // register form
+    }
+
+    #[test]
+    fn the_host_line_names_the_cpu_and_windows() {
+        // e.g. "  host: AMD EPYC 7763 64-Core Processor, Windows 10.0.26100\n"
+        let line = host();
+        let framed = line.starts_with("  host: ") && line.ends_with('\n');
+        assert!(framed, "{line:?}");
+        let inner = line.trim_start_matches("  host: ").trim_end();
+        let (cpu, windows) = inner.rsplit_once(", Windows ").expect(&line);
+        let named = !cpu.is_empty() && cpu == cpu.trim() && !cpu.contains('\0');
+        assert!(named, "{line:?}");
+        let version: Vec<u32> = windows.split('.').filter_map(|n| n.parse().ok()).collect();
+        assert!(version.len() == 3 && version[0] >= 10, "{line:?}");
+        println!("{line}");
     }
 
     #[test]
@@ -847,5 +1024,39 @@ mod tests {
             emulate_as(EXCEPTION_ACCESS_VIOLATION, &clzero, 0, &mut xmm),
             None
         );
+    }
+
+    #[test]
+    fn instruction_bytes_stop_at_the_end_of_their_page() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree, VirtualProtect,
+        };
+        // rdpru, then the next instruction (mov rcx, rax) and padding.
+        let mut code = [0x90_u8; 16];
+        code[..6].copy_from_slice(&[0x0f, 0x01, 0xfd, 0x48, 0x89, 0xc1]);
+        // SAFETY: two fresh pages of ours, the second made unreadable, so a
+        // read past the end of the first faults.
+        unsafe {
+            let page = VirtualAlloc(
+                std::ptr::null(),
+                0x2000,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+            .cast::<u8>();
+            assert!(!page.is_null());
+            let mut old = 0;
+            let guard = page.add(0x1000).cast();
+            assert_ne!(VirtualProtect(guard, 0x1000, PAGE_NOACCESS, &mut old), 0);
+            page.copy_from_nonoverlapping(code.as_ptr(), code.len());
+            let whole = "0f 01 fd 48 89 c1 90 90 90 90 90 90 90 90 90";
+            assert_eq!(instruction_bytes(page as usize), whole);
+            // The page's last three bytes: rdpru, and nothing read after it.
+            let end = page.add(0x1000 - 3);
+            end.copy_from_nonoverlapping(code.as_ptr(), 3);
+            assert_eq!(instruction_bytes(end as usize), "0f 01 fd");
+            VirtualFree(page.cast(), 0, MEM_RELEASE);
+        }
     }
 }

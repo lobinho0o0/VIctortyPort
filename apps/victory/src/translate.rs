@@ -145,6 +145,8 @@ type Kept = std::sync::Arc<Mutex<Vec<(String, emit::HostShader)>>>;
 
 /// The optional checks after emission, one set per thread.
 struct Checks {
+    /// The wave sizes to translate for.
+    target: emit::Target,
     /// Shaders named in `VICTORY_PAIRS` (`vs+ps,...`, label substrings),
     /// kept to build those pipelines after the walk.
     keep: Option<Kept>,
@@ -158,6 +160,7 @@ pub fn run(
     pipelines: bool,
     list: bool,
     jobs: Option<usize>,
+    host_lanes: Option<(u32, u32)>,
 ) -> Result<()> {
     let paths = crate::default_paths(paths)?;
     let dll = validate.then(Validator::default_path).flatten();
@@ -169,8 +172,21 @@ pub fn run(
                 .map_or("dxil.dll".into(), |p| p.display().to_string())
         );
     }
+    let mut target = emit::Target::ANY;
     if pipelines {
-        Host::new(false).map_err(anyhow::Error::msg)?;
+        target = Host::new(false).map_err(anyhow::Error::msg)?.target();
+    }
+    if let Some((lanes_min, lanes_max)) = host_lanes {
+        target = emit::Target {
+            lanes_min,
+            lanes_max,
+        };
+    }
+    if target != emit::Target::ANY {
+        println!(
+            "host waves   {}-{} lanes",
+            target.lanes_min, target.lanes_max
+        );
     }
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
@@ -204,6 +220,7 @@ pub fn run(
                             ..Tally::default()
                         };
                         let mut checks = Checks {
+                            target,
                             keep: (!pairs.is_empty()).then(|| kept.clone()),
                             validator: validate
                                 .then(|| Validator::load(dll.as_deref()).ok())
@@ -330,7 +347,9 @@ fn translate(
     for p in programs {
         t.programs += 1;
         match ir::build(&p.patched_code(), p.wave64, p.vgprs) {
-            Ok(program) => {
+            Ok(mut program) => {
+                victory_shader::unspill::unspill(&mut program, &p.layout, p.stage);
+                victory_shader::sgpr_spill::forward(&mut program);
                 t.translated += 1;
                 t.instructions += program.blocks.iter().map(|b| b.insts.len()).sum::<usize>();
                 let res = match resource::track(&program, &p.layout, p.stage) {
@@ -386,7 +405,7 @@ fn translate(
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
-                    match emit::emit(&container, &p, &program, &s, &i, &r) {
+                    match emit::emit(&container, &p, &program, &s, &i, &r, checks.target) {
                         Ok(shader) => {
                             *counter(t, p.stage, 1) += 1;
                             check(shader, t, checks, label);
@@ -521,6 +540,7 @@ fn tally_io(r: &io::Io, t: &mut Tally) {
         match i {
             io::Interp::Interpolated { .. } => t.interpolated += 1,
             io::Interp::Vertex { .. } => t.vertex_values += 1,
+            io::Interp::Weighted { .. } => t.interpolated += 1,
         }
     }
     for e in &r.exports {
@@ -547,7 +567,7 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
     let mut traced = HashSet::new();
     for leaf in r.descriptors.iter().flat_map(|d| d.source.leaves()) {
         let a = match *leaf {
-            resource::Source::Loaded { load, .. } => {
+            resource::Source::Loaded { load, .. } | resource::Source::Fetched { load, .. } => {
                 t.loaded += 1;
                 address(load)
             }
@@ -560,7 +580,15 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
                 t.constant += 1;
                 None
             }
-            resource::Source::Phi { .. } => unreachable!("leaves are no phis"),
+            // The previous loop pass's value or an unwritten register:
+            // no source of their own.
+            resource::Source::Carried { .. } | resource::Source::Unset => None,
+            resource::Source::Phi { .. }
+            | resource::Source::Select { .. }
+            | resource::Source::Lanes { .. }
+            | resource::Source::Paths { .. } => {
+                unreachable!("leaves are no phis, selects or per-lane choices")
+            }
         };
         // Heaps hold dynamic resources, which no used entry lists; code
         // tables are no root parameter.

@@ -298,7 +298,9 @@ impl Instruction {
                             | "ds_gws_sema_release_all"
                     ) {
                     0
-                } else if pair || name.contains("cmpst") || name.contains("mskor") {
+                } else if pair || name.contains("cmpst") || name.contains("mskor")
+                    || name == "ds_wrap_rtn_b32"
+                {
                     2
                 } else {
                     1
@@ -385,6 +387,9 @@ impl Instruction {
                 let glc = bit(w0, 16);
                 let n = data_dwords(name);
                 let (load, atomic) = (name.contains("_load_"), name.contains("_atomic_"));
+                // Scratch with `saddr` 0x7F (EXEC_HI) has neither address
+                // register, only the offset (LLVM's GFX10 "ST" mode).
+                let st = self.encoding == Encoding::Scratch && saddr == 0x7F;
                 let addr = match self.encoding {
                     Encoding::Flat => Some(vector(w1 & 0xFF, 2)),
                     Encoding::Global => Some(vector(w1 & 0xFF, 1 + u8::from(saddr == NULL))),
@@ -400,7 +405,7 @@ impl Instruction {
                     dst: (load || atomic && glc).then(|| vector(w1 >> 24, ret)),
                     addr,
                     data: (!load).then(|| vector(w1 >> 8 & 0xFF, n)),
-                    saddr: (self.encoding != Encoding::Flat)
+                    saddr: (self.encoding != Encoding::Flat && !st)
                         .then(|| scalar(saddr, 1 + u8::from(self.encoding == Encoding::Global))),
                     offset: match self.encoding {
                         Encoding::Flat => (w0 & 0x7FF) as i16,
@@ -805,9 +810,16 @@ fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
     } else if name.contains("_mip") {
         packed += 1;
     }
-    if a16 {
-        whole + 2 * derivs.div_ceil(2) + packed.div_ceil(2)
+    // GFX10.3 sizes derivatives by the opcode (`_g16`: two per dword, each
+    // direction its own) and coordinates and levels by a16, apart (LLVM
+    // `SITargetLowering::lowerImage` where `hasG16`; its MC test
+    // gfx10_asm_mimg.s has `image_sample_d ... 2D a16` with five address
+    // dwords: four derivatives and the packed coordinates).
+    let derivs = if name.ends_with("_g16") {
+        2 * derivs.div_ceil(2)
     } else {
-        whole + 2 * derivs + packed
-    }
+        2 * derivs
+    };
+    let packed = if a16 { packed.div_ceil(2) } else { packed };
+    whole + derivs + packed
 }

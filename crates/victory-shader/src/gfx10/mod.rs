@@ -290,36 +290,43 @@ fn instruction(code: &[u8], offset: usize) -> Result<Instruction, ShaderError> {
     })
 }
 
-fn name(encoding: Encoding, opcode: u16) -> Option<&'static str> {
-    use opcodes as t;
-    let (table, op) = match encoding {
-        Encoding::Sop2 => (t::SOP2, opcode),
-        Encoding::Sopk => (t::SOPK, opcode),
-        Encoding::Sop1 => (t::SOP1, opcode),
-        Encoding::Sopc => (t::SOPC, opcode),
-        Encoding::Sopp => (t::SOPP, opcode),
-        Encoding::Smem => (t::SMEM, opcode),
-        Encoding::Vop2 => (t::VOP2, opcode),
-        Encoding::Vop1 => (t::VOP1, opcode),
-        Encoding::Vopc => (t::VOPC, opcode),
-        // VOP3 also encodes the VOPC, VOP2 and VOP1 opcodes at fixed bases.
-        Encoding::Vop3 => match opcode {
-            0x000..0x100 => (t::VOPC, opcode),
-            0x100..0x140 => (t::VOP2, opcode - 0x100),
-            0x180..0x200 => (t::VOP1, opcode - 0x180),
-            _ => (t::VOP3, opcode),
-        },
-        Encoding::Vop3p => (t::VOP3P, opcode),
-        Encoding::Vintrp => (t::VINTRP, opcode),
-        Encoding::Ds => (t::DS, opcode),
-        Encoding::Mubuf => (t::MUBUF, opcode),
-        Encoding::Mtbuf => (t::MTBUF, opcode),
-        Encoding::Mimg => (t::MIMG, opcode),
-        Encoding::Exp => return Some("exp"),
-        Encoding::Flat => (t::FLAT, opcode),
-        Encoding::Global => (t::GLOBAL, opcode),
-        Encoding::Scratch => (t::SCRATCH, opcode),
+impl Encoding {
+    fn table(self) -> &'static [(u16, &'static str)] {
+        use opcodes as t;
+        match self {
+            Self::Sop2 => t::SOP2,
+            Self::Sopk => t::SOPK,
+            Self::Sop1 => t::SOP1,
+            Self::Sopc => t::SOPC,
+            Self::Sopp => t::SOPP,
+            Self::Smem => t::SMEM,
+            Self::Vop2 => t::VOP2,
+            Self::Vop1 => t::VOP1,
+            Self::Vopc => t::VOPC,
+            Self::Vop3 => t::VOP3,
+            Self::Vop3p => t::VOP3P,
+            Self::Vintrp => t::VINTRP,
+            Self::Ds => t::DS,
+            Self::Mubuf => t::MUBUF,
+            Self::Mtbuf => t::MTBUF,
+            Self::Mimg => t::MIMG,
+            Self::Exp => &[(0, "exp")],
+            Self::Flat => t::FLAT,
+            Self::Global => t::GLOBAL,
+            Self::Scratch => t::SCRATCH,
+        }
+    }
+}
+
+pub(crate) fn name(encoding: Encoding, opcode: u16) -> Option<&'static str> {
+    // VOP3 also encodes the VOPC, VOP2 and VOP1 opcodes at fixed bases.
+    let (encoding, op) = match (encoding, opcode) {
+        (Encoding::Vop3, 0x000..0x100) => (Encoding::Vopc, opcode),
+        (Encoding::Vop3, 0x100..0x140) => (Encoding::Vop2, opcode - 0x100),
+        (Encoding::Vop3, 0x180..0x200) => (Encoding::Vop1, opcode - 0x180),
+        _ => (encoding, opcode),
     };
+    let table = encoding.table();
     table
         .binary_search_by_key(&op, |&(o, _)| o)
         .ok()
@@ -331,18 +338,34 @@ fn isa(offset: usize, reason: &'static str) -> ShaderError {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod test_asm {
+    use super::Encoding;
 
-    const S_ENDPGM: u32 = 0xBF81_0000;
+    pub const S_ENDPGM: u32 = 0xBF81_0000;
     /// s_branch / s_cbranch_scc0 with a dword offset relative to the next instruction.
-    const fn sopp(op: u32, simm16: i16) -> u32 {
+    pub const fn sopp(op: u32, simm16: i16) -> u32 {
         0xBF80_0000 | op << 16 | simm16 as u16 as u32
     }
 
-    fn bytes(words: &[u32]) -> Vec<u8> {
+    pub fn bytes(words: &[u32]) -> Vec<u8> {
         words.iter().flat_map(|w| w.to_le_bytes()).collect()
     }
+
+    pub const ENCODINGS: &[Encoding] = &[
+        Encoding::Sop2, Encoding::Sopk, Encoding::Sop1, Encoding::Sopc, Encoding::Sopp,
+        Encoding::Smem, Encoding::Vop2, Encoding::Vop1, Encoding::Vopc, Encoding::Vop3,
+        Encoding::Vop3p, Encoding::Vintrp, Encoding::Ds, Encoding::Mubuf, Encoding::Mtbuf,
+        Encoding::Mimg, Encoding::Exp, Encoding::Flat, Encoding::Global, Encoding::Scratch,
+    ];
+
+    pub fn opcodes() -> impl Iterator<Item = (Encoding, u16, &'static str)> {
+        ENCODINGS.iter().flat_map(|&e| e.table().iter().map(move |&(op, name)| (e, op, name)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{test_asm::*, *};
 
     fn summary(code: &[u32]) -> Vec<(usize, usize, &'static str)> {
         decode(&bytes(code))
@@ -354,27 +377,7 @@ mod tests {
 
     #[test]
     fn tables_are_sorted() {
-        for t in [
-            opcodes::SOP2,
-            opcodes::SOPK,
-            opcodes::SOP1,
-            opcodes::SOPC,
-            opcodes::SOPP,
-            opcodes::SMEM,
-            opcodes::VOP2,
-            opcodes::VOP1,
-            opcodes::VOPC,
-            opcodes::VOP3,
-            opcodes::VOP3P,
-            opcodes::VINTRP,
-            opcodes::DS,
-            opcodes::MUBUF,
-            opcodes::MTBUF,
-            opcodes::MIMG,
-            opcodes::FLAT,
-            opcodes::GLOBAL,
-            opcodes::SCRATCH,
-        ] {
+        for t in ENCODINGS.iter().map(|e| e.table()) {
             assert!(t.windows(2).all(|w| w[0].0 < w[1].0));
         }
     }
@@ -406,6 +409,30 @@ mod tests {
                 (44, 1, "s_endpgm"),
             ]
         );
+    }
+
+    #[test]
+    fn image_address_dwords_by_form() {
+        // 2D: offset, bias and reference a dword each; 16-bit derivatives
+        // (g16 opcodes) two per dword, each direction its own; a16 packs
+        // the coordinates and the level, not the derivatives (the counts
+        // with a16 are those of LLVM's gfx10_asm_mimg.s).
+        for (op, a16, n) in [
+            (0x22u32, false, 6), // image_sample_d
+            (0x22, true, 5),     // image_sample_d, a16
+            (0x23, true, 6),     // image_sample_d_cl, a16
+            (0xA2, false, 4),    // image_sample_d_g16
+            (0xA2, true, 3),     // image_sample_d_g16, a16
+            (0xBB, false, 7),    // image_sample_c_d_cl_o_g16
+            (0x33, true, 7),     // image_sample_d_cl_o, a16
+        ] {
+            let w0 = 0xF000_0000 | (op & 0x7F) << 18 | op >> 7 | 1 << 3 | 1 << 8;
+            let d = decode(&bytes(&[w0, u32::from(a16) << 30, S_ENDPGM])).unwrap();
+            let Fields::Image { addr, .. } = d[0].fields(false) else {
+                panic!("{:?}", d[0].name())
+            };
+            assert_eq!(addr, [Operand::Vector { reg: 0, dwords: n }], "{:?}", d[0].name());
+        }
     }
 
     #[test]
@@ -473,6 +500,18 @@ mod tests {
                 (24, "s_setpc_b64"),
             ]
         );
+    }
+
+    /// RDNA2 (GFX10.3) has the fused legacy multiply-adds at these
+    /// opcodes: LLVM's gfx1030 assembler tests encode
+    /// `v_fma_legacy_f32 v0, v1, v2, v3` and `v_fmac_legacy_f32_e32 v0,
+    /// v1, v2` as these words.
+    #[test]
+    fn legacy_multiply_adds_are_the_fused_ones() {
+        let fma = summary(&[0xD540_0000, 0x040E_0501, S_ENDPGM]);
+        assert_eq!(fma[0].2, "v_fma_legacy_f32");
+        let fmac = summary(&[0x0C00_0501, S_ENDPGM]);
+        assert_eq!(fmac[0].2, "v_fmac_legacy_f32");
     }
 
     #[test]

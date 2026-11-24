@@ -213,8 +213,78 @@ fn dump_on() -> bool {
     *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
 }
 
+/// `VICTORY_PRESENT_TARGET=<width>x<height>:<format>[:<n>]`: present the
+/// `n`-th (first-use order, default 0) texture of that size and DXGI format
+/// the frame renders to or writes, in place of what the title presents, to
+/// see a pass the final image does not show (e.g. the G-buffer while lighting
+/// is still black). Frames without such a texture present as usual.
+fn present_spec() -> Option<(u64, u32, i32, usize)> {
+    static SPEC: std::sync::OnceLock<Option<(u64, u32, i32, usize)>> = std::sync::OnceLock::new();
+    *SPEC.get_or_init(|| {
+        let v = std::env::var("VICTORY_PRESENT_TARGET").ok()?;
+        let mut parts = v.split(':');
+        let (w, h) = parts.next()?.split_once('x')?;
+        let format = parts.next()?.trim().parse().ok()?;
+        let n = parts.next().map_or(Some(0), |n| n.trim().parse().ok())?;
+        let spec = (w.trim().parse().ok()?, h.trim().parse().ok()?, format, n);
+        tracing::info!(
+            ?spec,
+            "presenting a render target in place of the title's image"
+        );
+        Some(spec)
+    })
+}
+
+/// The frame being built and the textures it used that match
+/// [`present_spec`], in first-use order.
+#[allow(clippy::type_complexity)]
+static PRESENTED: std::sync::Mutex<(
+    u64,
+    Vec<(usize, std::sync::Arc<crate::resource::HostTexture>)>,
+)> = std::sync::Mutex::new((0, Vec::new()));
+
+fn note_present(resource: crate::object::This) {
+    let Some((w, h, format, _)) = present_spec() else {
+        return;
+    };
+    let Some(copy) = crate::resource::host_copy(resource) else {
+        return;
+    };
+    // SAFETY: a live resource.
+    let d = unsafe { copy.texture.GetDesc() };
+    if (d.Width, d.Height, d.Format.0) != (w, h, format)
+        || d.SampleDesc.Count > 1
+        || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+    {
+        return;
+    }
+    let frame = crate::queue::presented() + 1;
+    let mut p = PRESENTED.lock().unwrap_or_else(|e| e.into_inner());
+    if p.0 != frame {
+        *p = (frame, Vec::new());
+    }
+    if !p.1.iter().any(|&(r, _)| r == resource as usize) {
+        p.1.push((resource as usize, copy));
+    }
+}
+
+/// At the present of `frame`: the texture to show in place of the title's,
+/// if [`present_spec`] names one the frame used.
+pub(crate) fn present_override(frame: u64) -> Option<std::sync::Arc<crate::resource::HostTexture>> {
+    let (.., n) = present_spec()?;
+    let mut p = PRESENTED.lock().unwrap_or_else(|e| e.into_inner());
+    if p.0 != frame {
+        return None;
+    }
+    let (_, list) = std::mem::take(&mut *p);
+    list.into_iter().nth(n).map(|(_, t)| t)
+}
+
 /// Notes a title texture the frame being built renders to or writes.
 pub(crate) fn note_target(resource: crate::object::This) {
+    if !resource.is_null() {
+        note_present(resource);
+    }
     if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
         return;
     }
@@ -230,7 +300,9 @@ pub(crate) fn note_target(resource: crate::object::This) {
 pub(crate) fn dump_targets(frame: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     let targets = std::mem::take(&mut *TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
-    let Some(host) = crate::host::host() else { return };
+    let Some(host) = crate::host::host() else {
+        return;
+    };
     for (i, (resource, copy)) in targets.iter().enumerate() {
         let texture = &copy.texture;
         // SAFETY: a live resource.
@@ -240,7 +312,15 @@ pub(crate) fn dump_targets(frame: u64) {
         }
         // Every submission has run; the dump's list moves it there and back.
         let state = copy.state.load(Relaxed);
-        dump_one(host, texture, state, frame, i, *resource as crate::object::This, &d);
+        dump_one(
+            host,
+            texture,
+            state,
+            frame,
+            i,
+            *resource as crate::object::This,
+            &d,
+        );
     }
 }
 
@@ -271,7 +351,9 @@ fn dump_one(
     };
     list.close();
     host.execute(&[&list]);
-    let Some((buffer, footprint)) = read else { return };
+    let Some((buffer, footprint)) = read else {
+        return;
+    };
     let f = footprint.Footprint;
     let mut data = std::ptr::null_mut();
     // SAFETY: the copy finished; the mapping spans the footprint's rows.
@@ -281,7 +363,13 @@ fn dump_one(
         }
         let pitch = f.RowPitch as usize;
         let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
-        if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
+        if let Some(rgba) = to_rgba(
+            f.Format.0 as u32,
+            f.Width as usize,
+            f.Height as usize,
+            pitch,
+            rows,
+        ) {
             let name = format!(
                 "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}",
                 d.Width, d.Height, d.Format.0
@@ -295,7 +383,11 @@ fn dump_one(
 }
 
 fn half(h: u16) -> f32 {
-    let (sign, exp, man) = ((h >> 15) as u32, ((h >> 10) & 0x1f) as i32, (h & 0x3ff) as f32);
+    let (sign, exp, man) = (
+        (h >> 15) as u32,
+        ((h >> 10) & 0x1f) as i32,
+        (h & 0x3ff) as f32,
+    );
     let v = match exp {
         0 => man * 2f32.powi(-24),
         31 => f32::INFINITY,
@@ -323,7 +415,8 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
     let mut out = Vec::with_capacity(w * h * 4);
     let px = |x: usize, y: usize, n: usize| &rows[y * pitch + x * n..][..n];
     let u16_at = |b: &[u8], i: usize| u16::from_le_bytes([b[2 * i], b[2 * i + 1]]);
-    let u32_at = |b: &[u8], i: usize| u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap_or([0; 4]));
+    let u32_at =
+        |b: &[u8], i: usize| u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap_or([0; 4]));
     // Channel values as floats, then scaled.
     type Decode = Box<dyn Fn(&[u8]) -> [f32; 3]>;
     let (n, decode): (usize, Decode) = match format {
@@ -345,22 +438,58 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
             }
             return Some(out);
         }
-        23..=25 => (4, Box::new(move |b| {
-            let v = u32_at(b, 0);
-            [(v & 0x3ff) as f32, (v >> 10 & 0x3ff) as f32, (v >> 20 & 0x3ff) as f32]
-        })),
-        26 => (4, Box::new(move |b| {
-            let v = u32_at(b, 0);
-            [small_float(v & 0x7ff, 6), small_float(v >> 11 & 0x7ff, 6), small_float(v >> 22, 5)]
-        })),
-        9..=11 => (8, Box::new(move |b| [half(u16_at(b, 0)), half(u16_at(b, 1)), half(u16_at(b, 2))])),
-        33..=34 => (4, Box::new(move |b| [half(u16_at(b, 0)), half(u16_at(b, 1)), 0.0])),
-        1..=2 => (16, Box::new(move |b| {
-            [0, 1, 2].map(|i| f32::from_bits(u32_at(b, i)))
-        })),
-        15..=16 => (8, Box::new(move |b| [f32::from_bits(u32_at(b, 0)), f32::from_bits(u32_at(b, 1)), 0.0])),
-        35..=38 => (4, Box::new(move |b| [f32::from(u16_at(b, 0)), f32::from(u16_at(b, 1)), 0.0])),
-        48..=52 => (2, Box::new(move |b| [f32::from(b[0]), f32::from(b[1]), 0.0])),
+        23..=25 => (
+            4,
+            Box::new(move |b| {
+                let v = u32_at(b, 0);
+                [
+                    (v & 0x3ff) as f32,
+                    (v >> 10 & 0x3ff) as f32,
+                    (v >> 20 & 0x3ff) as f32,
+                ]
+            }),
+        ),
+        26 => (
+            4,
+            Box::new(move |b| {
+                let v = u32_at(b, 0);
+                [
+                    small_float(v & 0x7ff, 6),
+                    small_float(v >> 11 & 0x7ff, 6),
+                    small_float(v >> 22, 5),
+                ]
+            }),
+        ),
+        9..=11 => (
+            8,
+            Box::new(move |b| [half(u16_at(b, 0)), half(u16_at(b, 1)), half(u16_at(b, 2))]),
+        ),
+        33..=34 => (
+            4,
+            Box::new(move |b| [half(u16_at(b, 0)), half(u16_at(b, 1)), 0.0]),
+        ),
+        1..=2 => (
+            16,
+            Box::new(move |b| [0, 1, 2].map(|i| f32::from_bits(u32_at(b, i)))),
+        ),
+        15..=16 => (
+            8,
+            Box::new(move |b| {
+                [
+                    f32::from_bits(u32_at(b, 0)),
+                    f32::from_bits(u32_at(b, 1)),
+                    0.0,
+                ]
+            }),
+        ),
+        35..=38 => (
+            4,
+            Box::new(move |b| [f32::from(u16_at(b, 0)), f32::from(u16_at(b, 1)), 0.0]),
+        ),
+        48..=52 => (
+            2,
+            Box::new(move |b| [f32::from(b[0]), f32::from(b[1]), 0.0]),
+        ),
         // Single channels (and depth planes): shown as grey.
         39..=43 => (4, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
         19..=22 => (8, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),

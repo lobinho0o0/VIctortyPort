@@ -39,6 +39,7 @@ struct Global {
     /// Its pointer type.
     ptr: Ty,
     space: u32,
+    align: u64,
     /// An internal constant with this initialiser (a constant table).
     init: Option<u32>,
 }
@@ -73,7 +74,6 @@ pub(crate) enum Bin {
 pub(crate) enum Rmw {
     Xchg = 0,
     Add = 1,
-    Sub = 2,
     And = 3,
     Or = 5,
     Xor = 6,
@@ -96,6 +96,7 @@ pub(crate) enum Cast {
 }
 
 /// Compare predicates: floats 0-15, integers 32-41.
+#[allow(dead_code)]
 pub(crate) mod pred {
     pub const FALSE: u8 = 0;
     pub const OEQ: u8 = 1;
@@ -143,6 +144,8 @@ enum Op {
     AtomicRmw(Rmw, V, V),
     /// Pointer, expected, new; returns `{i32, i1}`.
     CmpXchg(V, V, V),
+    /// One of the type, per lane (a local array); the size constant.
+    Alloca(Ty, V),
 }
 
 #[derive(Debug, Clone)]
@@ -216,6 +219,47 @@ impl Module {
         self.types.push(def.clone());
         self.type_ids.insert(def, t);
         Ty(t)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn uses_of(&self, target: V) -> usize {
+        let mut n = 0;
+        let mut count = |v: V| {
+            if v == target {
+                n += 1;
+            }
+        };
+        for inst in &self.insts {
+            match &inst.op {
+                Op::Bin(_, a, b) | Op::Cmp(_, a, b) | Op::Store(a, b) => {
+                    count(*a);
+                    count(*b);
+                }
+                Op::Cast(_, a) | Op::Extract(a, _) | Op::Load(a) => count(*a),
+                Op::AtomicRmw(_, c, t) => {
+                    count(*c);
+                    count(*t);
+                }
+                Op::Select(c, t, f) | Op::CmpXchg(c, t, f) => {
+                    count(*c);
+                    count(*t);
+                    count(*f);
+                }
+                Op::Call(_, args) => args.iter().for_each(|&v| count(v)),
+                Op::Phi(incoming) => incoming.iter().for_each(|&(v, _)| count(v)),
+                Op::Gep(_, base, idx) => {
+                    count(*base);
+                    idx.iter().for_each(|&v| count(v));
+                }
+                Op::Alloca(..) => {}
+            }
+        }
+        for block in &self.blocks {
+            if let Some(Term::CondBr(cond, _, _)) = block.term {
+                count(cond);
+            }
+        }
+        n
     }
 
     pub fn void(&mut self) -> Ty {
@@ -323,9 +367,15 @@ impl Module {
             ty,
             ptr,
             space,
+            align: 3,
             init: None,
         });
         V::Global(self.globals.len() as u32 - 1)
+    }
+
+    pub fn align_global_to_eight(&mut self, global: V) {
+        let V::Global(n) = global else { unreachable!() };
+        self.globals[n as usize].align = 4; // log2(alignment) + 1
     }
 
     /// An internal constant global initialised with the constant `init`.
@@ -344,6 +394,19 @@ impl Module {
     pub fn new_block(&mut self) -> usize {
         self.blocks.push(Block::default());
         self.blocks.len() - 1
+    }
+
+    /// The bits of an integer or float constant (integers as stored,
+    /// sign-extended).
+    pub fn known(&self, v: V) -> Option<i64> {
+        match v {
+            V::Const(i) => match self.consts[i as usize].1 {
+                Const::Int(x) => Some(x),
+                Const::Float(bits) => Some(i64::from(bits)),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     pub fn type_of(&self, v: V) -> Ty {
@@ -447,6 +510,12 @@ impl Module {
         self.extract(block, r, 0)
     }
 
+    /// Memory of type `ty` private to each lane (`alloca`), for the entry block.
+    pub fn alloca(&mut self, block: usize, ty: Ty) -> V {
+        let (ptr, one) = (self.ptr(ty), self.i32(1));
+        self.push(block, ptr, Op::Alloca(ty, one))
+    }
+
     pub fn set_phi(&mut self, phi: V, incoming: Vec<(V, usize)>) {
         let V::Inst(i) = phi else { panic!() };
         self.insts[i as usize].op = Op::Phi(incoming);
@@ -473,6 +542,37 @@ impl Module {
     }
 
     /// The module as bitcode.
+    /// Which instructions are written: every body instruction, the branch
+    /// conditions, and whatever they read, transitively (a phi nothing reads
+    /// is dropped). A worklist visits each instruction once, so a long chain
+    /// of merges costs one pass, not one pass per merge.
+    fn live(&self) -> Vec<bool> {
+        let mut live = vec![false; self.insts.len()];
+        let mut work: Vec<u32> = Vec::new();
+        let mark = |live: &mut [bool], work: &mut Vec<u32>, v: V| {
+            if let V::Inst(i) = v
+                && !live[i as usize]
+            {
+                live[i as usize] = true;
+                work.push(i);
+            }
+        };
+        for b in &self.blocks {
+            for &i in &b.body {
+                mark(&mut live, &mut work, V::Inst(i));
+            }
+            if let Some(Term::CondBr(c, ..)) = b.term {
+                mark(&mut live, &mut work, c);
+            }
+        }
+        while let Some(i) = work.pop() {
+            for_each_operand(&self.insts[i as usize].op, |v| {
+                mark(&mut live, &mut work, v)
+            });
+        }
+        live
+    }
+
     pub fn write(&self) -> Vec<u8> {
         let mut w = Writer::default();
         w.bytes(b"BC\xC0\xDE");
@@ -552,7 +652,7 @@ impl Module {
                     u64::from(g.space) << 2 | 2 | constant,
                     init,
                     linkage,
-                    3,
+                    g.align,
                     0,
                 ],
             );
@@ -606,56 +706,12 @@ impl Module {
         w.exit();
 
         // Phis nothing reads are left out (one register per phi makes many).
-        let mut live = vec![false; self.insts.len()];
-        let mark = |live: &mut Vec<bool>, v: V| {
-            if let V::Inst(i) = v
-                && !live[i as usize]
-            {
-                live[i as usize] = true;
-                return true;
-            }
-            false
-        };
-        let operands = |op: &Op| -> Vec<V> {
-            match op {
-                Op::Bin(_, a, b) | Op::Cmp(_, a, b) | Op::Store(a, b) | Op::AtomicRmw(_, a, b) => {
-                    vec![*a, *b]
-                }
-                Op::Cast(_, v) | Op::Extract(v, _) | Op::Load(v) => vec![*v],
-                Op::Select(a, b, c) | Op::CmpXchg(a, b, c) => vec![*a, *b, *c],
-                Op::Call(_, args) => args.clone(),
-                Op::Phi(inc) => inc.iter().map(|x| x.0).collect(),
-                Op::Gep(_, p, idx) => std::iter::once(*p).chain(idx.iter().copied()).collect(),
-            }
-        };
-        for b in &self.blocks {
-            for &i in &b.body {
-                live[i as usize] = true;
-            }
-            if let Some(Term::CondBr(c, ..)) = b.term {
-                mark(&mut live, c);
-            }
-        }
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for (i, inst) in self.insts.iter().enumerate() {
-                if live[i] {
-                    for v in operands(&inst.op) {
-                        changed |= mark(&mut live, v);
-                    }
-                }
-            }
-        }
+        let live = self.live();
 
         // Blocks are laid out in reverse postorder, so every block follows
         // its forward predecessors (drivers take a branch to an earlier
         // block for a loop's back edge).
-        let succs = |b: usize| match self.blocks[b].term {
-            Some(Term::Br(t)) => vec![t],
-            Some(Term::CondBr(_, t, f)) => vec![t, f],
-            _ => vec![],
-        };
+        let succs = |b: usize| successors(self.blocks[b].term);
         let mut seen = vec![false; self.blocks.len()];
         let mut post = Vec::new();
         let mut stack = vec![(0usize, 0usize)];
@@ -685,7 +741,7 @@ impl Module {
         // DXC's loops; the AMD driver hangs on divergent loops otherwise.
         let mut preds = vec![Vec::new(); self.blocks.len()];
         for &b in &post {
-            for s in succs(b) {
+            for &s in succs(b).iter() {
                 preds[s].push(b);
             }
         }
@@ -795,6 +851,8 @@ impl Module {
         w.enter(FUNCTION_BLOCK, 4);
         w.record(1, &[layout.len() as u64]);
         let mut inst_id = base;
+        // The operands of variable-length records, reused across them.
+        let mut r: Vec<u64> = Vec::new();
         for b in layout.iter().map(|&b| &self.blocks[b]) {
             for &i in b.phis.iter().filter(|&&i| live[i as usize]).chain(&b.body) {
                 let inst = &self.insts[i as usize];
@@ -810,13 +868,15 @@ impl Module {
                     Op::Select(c, t, f) => w.record(29, &[rel(*t), rel(*f), rel(*c)]),
                     Op::Extract(a, idx) => w.record(26, &[rel(*a), u64::from(*idx)]),
                     Op::Call(f, args) => {
-                        let mut r = vec![0, 1 << 15, u64::from(self.funcs[*f as usize].ty.0)];
+                        r.clear();
+                        r.extend([0, 1 << 15, u64::from(self.funcs[*f as usize].ty.0)]);
                         r.push(rel(V::Func(*f)));
                         r.extend(args.iter().map(|&a| rel(a)));
                         w.record(34, &r);
                     }
                     Op::Phi(incoming) => {
-                        let mut r = vec![u64::from(inst.ty.0)];
+                        r.clear();
+                        r.push(u64::from(inst.ty.0));
                         for &(v, b) in incoming {
                             r.push(signed(i64::from(inst_id) - i64::from(abs(v))));
                             r.push(from(b));
@@ -824,7 +884,8 @@ impl Module {
                         w.record(16, &r);
                     }
                     Op::Gep(ty, p, idx) => {
-                        let mut r = vec![0, u64::from(ty.0), rel(*p)];
+                        r.clear();
+                        r.extend([0, u64::from(ty.0), rel(*p)]);
                         r.extend(idx.iter().map(|&i| rel(i)));
                         w.record(43, &r);
                     }
@@ -837,6 +898,12 @@ impl Module {
                     }
                     Op::CmpXchg(p, c, n) => {
                         w.record(46, &[rel(*p), rel(*c), rel(*n), 0, 6, 1, 6, 0]);
+                    }
+                    // [type, size type, size (absolute id), alignment 4
+                    // (log2 + 1) | explicit type (bit 6)].
+                    Op::Alloca(ty, n) => {
+                        let (nt, n) = (self.type_of(*n).0, abs(*n));
+                        w.record(19, &[u64::from(ty.0), u64::from(nt), u64::from(n), 3 | 64]);
                     }
                 }
                 if !self.is_void(inst.ty) {
@@ -867,6 +934,51 @@ const FUNCTION_BLOCK: u64 = 12;
 const VALUE_SYMTAB_BLOCK: u64 = 14;
 const METADATA_BLOCK: u64 = 15;
 const TYPE_BLOCK: u64 = 17;
+
+/// Calls `f` with every value `op` reads, in operand order.
+fn for_each_operand(op: &Op, mut f: impl FnMut(V)) {
+    match op {
+        Op::Bin(_, a, b) | Op::Cmp(_, a, b) | Op::Store(a, b) | Op::AtomicRmw(_, a, b) => {
+            f(*a);
+            f(*b);
+        }
+        Op::Cast(_, v) | Op::Extract(v, _) | Op::Load(v) => f(*v),
+        Op::Select(a, b, c) | Op::CmpXchg(a, b, c) => {
+            f(*a);
+            f(*b);
+            f(*c);
+        }
+        Op::Call(_, args) => args.iter().copied().for_each(f),
+        Op::Phi(inc) => inc.iter().for_each(|x| f(x.0)),
+        Op::Gep(_, p, idx) => {
+            f(*p);
+            idx.iter().copied().for_each(f);
+        }
+        // The size is a constant.
+        Op::Alloca(..) => {}
+    }
+}
+
+/// A block's successors (at most two), without allocating.
+struct Succs {
+    to: [usize; 2],
+    len: usize,
+}
+
+impl std::ops::Deref for Succs {
+    type Target = [usize];
+    fn deref(&self) -> &[usize] {
+        &self.to[..self.len]
+    }
+}
+
+fn successors(term: Option<Term>) -> Succs {
+    match term {
+        Some(Term::Br(t)) => Succs { to: [t, 0], len: 1 },
+        Some(Term::CondBr(_, t, f)) => Succs { to: [t, f], len: 2 },
+        _ => Succs { to: [0, 0], len: 0 },
+    }
+}
 
 fn chars(s: &str) -> Vec<u64> {
     s.bytes().map(u64::from).collect()
@@ -982,5 +1094,178 @@ mod tests {
         assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 1);
         assert_eq!(signed(-3), 7);
         assert_eq!(signed(2), 4);
+    }
+
+    /// A structured shader's shape: `stages` if/else diamonds in a row, each
+    /// merge with one phi per register (as the lowering makes them), then a
+    /// loop, and a tail that reads only the first `read` registers.
+    fn synthetic(regs: usize, stages: usize, read: usize) -> Module {
+        let mut m = Module::default();
+        let i32t = m.int(32);
+        let void = m.void();
+        let fty = m.func_ty(i32t, vec![i32t, i32t]);
+        let f = m.function("dx.op.synthetic", fty, Some(Attr::ReadNone), false);
+        let main_ty = m.func_ty(void, vec![]);
+        m.function("main", main_ty, None, true);
+        let mut b = m.new_block();
+        let mut cur: Vec<V> = (0..regs).map(|r| m.i32(r as u32)).collect();
+        for s in 0..stages {
+            let c = m.cmp(b, pred::EQ, cur[0], cur[s % regs]);
+            let (t, e, j) = (m.new_block(), m.new_block(), m.new_block());
+            m.terminate(b, Term::CondBr(c, t, e));
+            let x = m.call(t, f, vec![cur[s % regs], cur[(s + 1) % regs]]);
+            m.terminate(t, Term::Br(j));
+            m.terminate(e, Term::Br(j));
+            cur = (0..regs)
+                .map(|r| {
+                    let p = m.phi(j, i32t);
+                    let tv = if r == s % regs { x } else { cur[r] };
+                    m.set_phi(p, vec![(tv, t), (cur[r], e)]);
+                    p
+                })
+                .collect();
+            b = j;
+        }
+        // A loop: header phis fed back from an empty latch (which is folded).
+        let (head, body, latch, exit) =
+            (m.new_block(), m.new_block(), m.new_block(), m.new_block());
+        m.terminate(b, Term::Br(head));
+        let phis: Vec<V> = (0..regs).map(|_| m.phi(head, i32t)).collect();
+        let one = m.i32(1);
+        let stepped: Vec<V> = phis
+            .iter()
+            .map(|&p| m.bin(body, Bin::Add, p, one))
+            .collect();
+        let c = m.cmp(body, pred::IULT, stepped[0], cur[0]);
+        m.terminate(head, Term::Br(body));
+        m.terminate(body, Term::CondBr(c, latch, exit));
+        m.terminate(latch, Term::Br(head));
+        for r in 0..regs {
+            m.set_phi(phis[r], vec![(cur[r], b), (stepped[r], latch)]);
+        }
+        let mut acc = stepped[0];
+        for &v in &stepped[1..read.max(1)] {
+            acc = m.bin(exit, Bin::Add, acc, v);
+        }
+        let _ = m.call(exit, f, vec![acc, cur[0]]);
+        m.terminate(exit, Term::Ret);
+        m
+    }
+
+    /// FNV-1a, to pin a written module's exact bytes.
+    fn fnv(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+        })
+    }
+
+    /// Liveness as `write` computed it before the worklist: whole passes over
+    /// the instructions until one changes nothing.
+    fn live_by_passes(m: &Module) -> Vec<bool> {
+        let mut live = vec![false; m.insts.len()];
+        for b in &m.blocks {
+            for &i in &b.body {
+                live[i as usize] = true;
+            }
+            if let Some(Term::CondBr(V::Inst(c), ..)) = b.term {
+                live[c as usize] = true;
+            }
+        }
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for (i, inst) in m.insts.iter().enumerate() {
+                if live[i] {
+                    for_each_operand(&inst.op, |v| {
+                        if let V::Inst(j) = v
+                            && !live[j as usize]
+                        {
+                            live[j as usize] = true;
+                            changed = true;
+                        }
+                    });
+                }
+            }
+        }
+        live
+    }
+
+    #[test]
+    fn worklist_liveness_matches_passes() {
+        for (regs, stages, read) in [(1, 0, 1), (1, 1, 1), (4, 3, 1), (8, 17, 3), (16, 40, 16)] {
+            let m = synthetic(regs, stages, read);
+            let live = m.live();
+            assert_eq!(live, live_by_passes(&m), "{regs} regs x {stages} stages");
+        }
+    }
+
+    #[test]
+    fn unread_phis_are_dropped() {
+        let mut m = Module::default();
+        let i32t = m.int(32);
+        let (entry, join) = (m.new_block(), m.new_block());
+        let (a, b) = (m.i32(1), m.i32(2));
+        m.terminate(entry, Term::Br(join));
+        let read = m.phi(join, i32t);
+        let unread = m.phi(join, i32t);
+        // A cycle of phis that only feed each other stays dead.
+        let cyc_a = m.phi(join, i32t);
+        let cyc_b = m.phi(join, i32t);
+        m.set_phi(read, vec![(a, entry)]);
+        m.set_phi(unread, vec![(b, entry)]);
+        m.set_phi(cyc_a, vec![(cyc_b, entry)]);
+        m.set_phi(cyc_b, vec![(cyc_a, entry)]);
+        let sum = m.bin(join, Bin::Add, read, b);
+        m.terminate(join, Term::Ret);
+        let ids = |v: V| match v {
+            V::Inst(i) => i as usize,
+            _ => unreachable!(),
+        };
+        let live = m.live();
+        assert!(live[ids(read)] && live[ids(sum)]);
+        assert!(!live[ids(unread)] && !live[ids(cyc_a)] && !live[ids(cyc_b)]);
+        assert_eq!(live, live_by_passes(&m));
+    }
+
+    #[test]
+    fn successors_of_each_terminator() {
+        assert!(successors(None).is_empty());
+        assert!(successors(Some(Term::Ret)).is_empty());
+        assert_eq!(&*successors(Some(Term::Br(7))), &[7]);
+        assert_eq!(&*successors(Some(Term::CondBr(V::Const(0), 3, 5))), &[3, 5]);
+    }
+
+    /// The written bytes are pinned to what the writer produced before the
+    /// worklist and the reused record buffers.
+    #[test]
+    fn written_bytes_unchanged() {
+        for ((regs, stages, read), len, hash) in [
+            ((64, 64, 64), 38_916, 0x9586_730c_f953_4a45),
+            ((128, 256, 32), 295_952, 0x89e5_de2d_64f0_8785),
+        ] {
+            let bytes = synthetic(regs, stages, read).write();
+            assert_eq!((bytes.len(), fnv(&bytes)), (len, hash), "{regs}x{stages}");
+        }
+    }
+
+    #[test]
+    #[ignore = "benchmark: cargo test --release -p victory-shader bitcode -- --ignored --nocapture"]
+    fn bench_write() {
+        for (regs, stages, read) in [(64, 64, 64), (128, 256, 32), (256, 512, 256)] {
+            let m = synthetic(regs, stages, read);
+            let bytes = m.write();
+            let runs = 5;
+            let t = std::time::Instant::now();
+            for _ in 0..runs {
+                std::hint::black_box(m.write());
+            }
+            let per = t.elapsed() / runs;
+            println!(
+                "write {regs} regs x {stages} stages ({} insts): {per:?}, {} bytes, fnv {:#018x}",
+                m.insts.len(),
+                bytes.len(),
+                fnv(&bytes)
+            );
+        }
     }
 }

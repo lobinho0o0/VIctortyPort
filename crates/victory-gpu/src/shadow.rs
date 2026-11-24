@@ -10,10 +10,9 @@
 //! in its copy. Ranges shaders write go back to title memory after the
 //! submission ([`Shadow::gpu_writes`]).
 //!
-//! shortcut: only the ranges draws are known to read are brought up to
-//! date (vertex and index buffer views, constant buffers in tables, root
-//! descriptors, buffer views in tables); buffers read through directly
-//! indexed heaps keep what their first use copied.
+//! Mirrored buffer SRVs in bound heaps also refresh at submission, since
+//! a shader may select their index dynamically. Directly indexed UAVs
+//! still need read/write tracking independent of conventional table use.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -42,7 +41,51 @@ pub(crate) struct Shadow {
     pending: Mutex<Vec<(usize, usize)>>,
     /// The copy's bytes before the submission ran, from an offset on,
     /// covering the ranges its shaders write: what the GPU wrote differs.
-    before: Mutex<Option<(usize, Vec<u8>)>>,
+    before: Mutex<Before>,
+}
+
+#[derive(Default)]
+struct Before {
+    snapshot: Option<(usize, Vec<u8>)>,
+    unchanged: UnchangedPages,
+}
+
+/// Pages already compared in full against this submission's snapshot.
+#[derive(Default)]
+struct UnchangedPages {
+    start: usize,
+    end: usize,
+    pages: Vec<bool>,
+}
+
+impl UnchangedPages {
+    fn begin(&mut self, start: usize, end: usize) {
+        if self.pages.is_empty() {
+            self.start = start;
+            self.end = end;
+            self.pages.resize(end.div_ceil(PAGE) - start / PAGE, false);
+        }
+    }
+
+    fn differs(&mut self, address: usize, current: &[u8], before: &[u8]) -> bool {
+        let page = address / PAGE;
+        let unchanged = &mut self.pages[page - self.start / PAGE];
+        if *unchanged {
+            return false;
+        }
+        if current != before {
+            return true;
+        }
+        // A later range can touch bytes a partial comparison missed. At
+        // the edges, only bytes covered by the snapshot can be compared.
+        *unchanged = address == (page * PAGE).max(self.start)
+            && address + current.len() == ((page + 1) * PAGE).min(self.end);
+        false
+    }
+
+    fn clear(&mut self) {
+        self.pages.clear();
+    }
 }
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
@@ -65,14 +108,28 @@ fn pooled(n: usize) -> Vec<u8> {
     v
 }
 
-/// Returns a snapshot buffer to the pool (at most 8 kept, the largest).
+/// Bytes of the snapshot memory kept for reuse.
+pub(crate) fn pool_bytes() -> u64 {
+    let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    pool.iter().map(|v| v.capacity() as u64).sum()
+}
+
+/// Bytes the pool keeps at most: snapshots of the world's 174 MB heap
+/// would otherwise keep 8 of that size (1.4 GB of host memory) for good.
+const POOL_BYTES: usize = 512 << 20;
+
+/// Returns a snapshot buffer to the pool (at most 8 kept, the largest,
+/// and no more than [`POOL_BYTES`] in all).
 fn give_back(v: Vec<u8>) {
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
-    if pool.len() > 8 {
-        pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-        pool.truncate(8);
-    }
+    pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
+    pool.truncate(8);
+    let mut total = 0;
+    pool.retain(|v| {
+        total += v.capacity();
+        total <= POOL_BYTES
+    });
 }
 
 const NOT_WATCHED: u8 = 2;
@@ -82,6 +139,15 @@ const NOT_WATCHED: u8 = 2;
 unsafe impl Send for Shadow {}
 // SAFETY: as above.
 unsafe impl Sync for Shadow {}
+
+impl Drop for Shadow {
+    fn drop(&mut self) {
+        // SAFETY: a live resource.
+        let bytes = unsafe { self.buffer.GetDesc() }.Width;
+        crate::memstat::sub(&crate::memstat::SHADOWS, bytes);
+        crate::memstat::sub(&crate::memstat::SHADOW_COUNT, 1);
+    }
+}
 
 impl Shadow {
     /// The host GPU address of a title address inside the buffer.
@@ -99,6 +165,13 @@ impl Shadow {
         address - self.start
     }
 
+    /// The copy's bytes at `[address, address + len)` (inside the buffer).
+    #[cfg(test)]
+    pub(crate) fn host_bytes(&self, address: u64, len: usize) -> Vec<u8> {
+        // SAFETY: inside the mapping; no submission runs while tests read.
+        unsafe { std::slice::from_raw_parts(self.data.add(self.offset(address) as usize), len) }.to_vec()
+    }
+
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
@@ -108,6 +181,10 @@ impl Shadow {
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
         let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
+        // SAFETY: a live resource.
+        let bytes = unsafe { buffer.GetDesc() }.Width;
+        crate::memstat::add(&crate::memstat::SHADOWS, bytes);
+        crate::memstat::add(&crate::memstat::SHADOW_COUNT, 1);
         Shadow {
             buffer,
             data,
@@ -155,8 +232,10 @@ impl Shadow {
             .push((address, address + len));
         let (from, to) = self.inside(address, len);
         // SAFETY: inside the mapping.
-        let host = |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
+        let host =
+            |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let before = &mut before.snapshot;
         let (start, end) = match &*before {
             Some((at, bytes)) => ((*at).min(from), (at + bytes.len()).max(to)),
             None => (from, to),
@@ -188,7 +267,11 @@ impl Shadow {
     /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
     /// written.
     pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
-        let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let Before {
+            snapshot,
+            unchanged,
+        } = &mut *before;
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
@@ -197,21 +280,25 @@ impl Shadow {
             && to <= taken + before.len()
             && from < to
         {
+            unchanged.begin(start + taken, start + taken + before.len());
             let before = &before[from - taken..to - taken];
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission, title memory read only where the GPU wrote.
-            const PIECE: usize = 64 << 10;
-            let mut title = vec![0u8; PIECE];
+            // An unchanged page is never modified by copy-back, so later
+            // overlapping ranges can skip it for the rest of the submission.
+            let mut title = None;
             let mut synced = Vec::new();
             let mut at = from;
             while at < to {
-                let n = (PIECE - (start + at) % PIECE).min(to - at);
+                let n = (PAGE - (start + at) % PAGE).min(to - at);
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                 let old = &before[at - from..at - from + n];
-                let title = &mut title[..n];
-                if host != old && crate::host::read_into((start + at) as *const u8, title) {
+                if unchanged.differs(start + at, host, old)
+                    && let title = &mut title.get_or_insert_with(|| vec![0u8; PAGE])[..n]
+                    && crate::host::read_into((start + at) as *const u8, title)
+                {
                     // Title memory with the GPU's bytes put in; the copy
                     // takes the title's bytes in turn.
                     let mut changed = false;
@@ -254,6 +341,7 @@ impl Shadow {
         if pending.is_empty()
             && let Some((_, bytes)) = snapshot.take()
         {
+            unchanged.clear();
             give_back(bytes);
         }
         written
@@ -393,16 +481,25 @@ pub(crate) fn unregister(resource: usize, start: u64) {
     buffers().remove(&(start, resource));
 }
 
-/// The copy of the innermost title buffer holding `[address, address +
-/// len)`, made on first use.
+/// The copy of a title buffer holding `[address, address + len)`: of one
+/// whose copy is made already if there is one (a buffer inside another,
+/// say in the world's 174 MB heap, then shares its copy instead of paying
+/// for its bytes twice, and the GPU's writes land in one copy), else of
+/// the innermost, made now.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
-    let key = map
+    let holding: Vec<((u64, usize), bool)> = map
         .range(..=(address, usize::MAX))
         .rev()
         .take(64)
-        .find(|(_, e)| e.end >= end)
+        .filter(|(_, e)| e.end >= end)
+        .map(|(k, e)| (*k, e.shadow.is_some()))
+        .collect();
+    let key = holding
+        .iter()
+        .find(|(_, made)| *made)
+        .or(holding.first())
         .map(|(k, _)| *k);
     let Some(key) = key else {
         drop(map);
@@ -449,8 +546,16 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
     let len = end.next_multiple_of(WINDOW) - start;
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(shadow) = map.get(&(start, len)) {
-        return Some(shadow.clone());
+    // Any window copied already that holds the range: a range crossing a
+    // window's end used to get a second copy of the same bytes.
+    if let Some(shadow) = map
+        .range(..=(start, u64::MAX))
+        .rev()
+        .take(64)
+        .find(|((s, l), _)| *s <= address && s + l >= end)
+        .map(|(_, shadow)| shadow.clone())
+    {
+        return Some(shadow);
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
@@ -496,4 +601,141 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ops::Range;
+
+    #[test]
+    fn partial_match_leaves_unchecked_bytes_visible() {
+        let mut unchanged = UnchangedPages::default();
+        let before = vec![0; PAGE];
+        let mut host = before.clone();
+        host[PAGE - 1] = 1;
+        unchanged.begin(PAGE, 2 * PAGE);
+
+        assert!(!unchanged.differs(PAGE, &host[..4], &before[..4]));
+        assert!(!unchanged.pages[0]);
+        assert!(unchanged.differs(PAGE, &host, &before));
+        assert!(!unchanged.pages[0]);
+    }
+
+    #[test]
+    fn snapshot_edges_are_cacheable_and_survive_later_ranges() {
+        let mut unchanged = UnchangedPages::default();
+        unchanged.begin(PAGE - 3, PAGE + 4);
+        assert!(!unchanged.differs(PAGE - 3, &[1; 3], &[1; 3]));
+        assert!(!unchanged.differs(PAGE, &[2; 4], &[2; 4]));
+        assert_eq!(unchanged.pages, [true, true]);
+
+        unchanged.begin(PAGE - 3, PAGE + 4);
+        assert!(!unchanged.differs(PAGE - 2, &[1; 2], &[1; 2]));
+        assert!(!unchanged.differs(PAGE + 1, &[2; 2], &[2; 2]));
+        assert_eq!(unchanged.pages, [true, true]);
+    }
+
+    #[test]
+    fn next_submission_checks_the_same_page_again() {
+        let mut unchanged = UnchangedPages::default();
+        unchanged.begin(0, 4);
+        assert!(!unchanged.differs(0, &[0; 4], &[0; 4]));
+        unchanged.clear();
+        unchanged.begin(0, 4);
+        assert!(unchanged.differs(0, &[0, 0, 0, 1], &[0; 4]));
+    }
+
+    // Both versions walk exactly the same declared ranges, in their
+    // original order. Only the page comparison differs.
+    fn scan(
+        host: &[u8],
+        before: &[u8],
+        ranges: &[Range<usize>],
+        mut differs: impl FnMut(usize, &[u8], &[u8]) -> bool,
+    ) -> usize {
+        let mut changed = 0;
+        for range in ranges {
+            let mut at = range.start;
+            while at < range.end {
+                let n = (PAGE - at % PAGE).min(range.end - at);
+                changed += usize::from(differs(at, &host[at..at + n], &before[at..at + n]));
+                at += n;
+            }
+        }
+        changed
+    }
+
+    #[test]
+    fn overlapping_ranges_match_uncached_comparisons() {
+        let before = vec![0; 4 * PAGE];
+        let mut host = before.clone();
+        for at in [2, PAGE - 1, PAGE + 5, 3 * PAGE + 7] {
+            host[at] = 1;
+        }
+        let ranges = [
+            0..4,
+            2..2 * PAGE + 3,
+            PAGE - 2..4 * PAGE,
+            2 * PAGE..3 * PAGE,
+        ];
+        let uncached = scan(&host, &before, &ranges, |_, host, before| host != before);
+        let mut unchanged = UnchangedPages::default();
+        unchanged.begin(0, before.len());
+        let cached = scan(&host, &before, &ranges, |at, host, before| {
+            unchanged.differs(at, host, before)
+        });
+        assert_eq!(uncached, 6);
+        assert_eq!(cached, uncached);
+        assert_eq!(unchanged.pages, [false, false, true, false]);
+    }
+
+    // cargo test --release -p victory-gpu benchmark_overlapping_copy_back -- --ignored --nocapture
+    #[test]
+    #[ignore = "synthetic CPU release benchmark"]
+    fn benchmark_overlapping_copy_back() {
+        use std::hint::black_box;
+        use std::time::{Duration, Instant};
+
+        const SIZE: usize = 128 << 20;
+        let before = vec![0xA5; SIZE];
+        let mut host = before.clone();
+        for page in (0..SIZE / PAGE).step_by(64) {
+            host[page * PAGE + PAGE / 2] ^= 0xFF;
+        }
+        let ranges: Vec<_> = (0..24).map(|i| i * PAGE + i..SIZE - i * 13).collect();
+        let mut baseline = [Duration::ZERO; 5];
+        let mut cached = [Duration::ZERO; 5];
+        let mut unchanged = UnchangedPages::default();
+        for (baseline, cached) in baseline.iter_mut().zip(&mut cached) {
+            let started = Instant::now();
+            let expected = scan(
+                black_box(&host),
+                black_box(&before),
+                black_box(&ranges),
+                |_, host, before| host != before,
+            );
+            *baseline = started.elapsed();
+
+            unchanged.clear();
+            let started = Instant::now();
+            unchanged.begin(0, before.len());
+            let actual = scan(
+                black_box(&host),
+                black_box(&before),
+                black_box(&ranges),
+                |at, host, before| unchanged.differs(at, host, before),
+            );
+            *cached = started.elapsed();
+            assert_eq!(actual, expected);
+        }
+        baseline.sort_unstable();
+        cached.sort_unstable();
+        println!(
+            "median of five runs, 24 overlapping ranges across 128 MiB: {:?} -> {:?} ({:.1}x)",
+            baseline[2],
+            cached[2],
+            baseline[2].as_secs_f64() / cached[2].as_secs_f64(),
+        );
+    }
 }

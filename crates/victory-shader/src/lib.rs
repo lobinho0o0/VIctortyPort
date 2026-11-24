@@ -14,7 +14,9 @@ pub mod io;
 pub mod ir;
 pub mod native;
 pub mod resource;
+pub mod sgpr_spill;
 pub mod structure;
+pub mod unspill;
 
 pub use dxbc::{Container, FourCC, Part};
 pub use dxil::{DxilProgram, ShaderKind, XboxExtras};

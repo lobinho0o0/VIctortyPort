@@ -63,11 +63,12 @@ const POLL: Duration = Duration::from_millis(8);
 
 /// The keyboard's stand-in gamepad (virtual key, button); README lists it.
 /// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C.
-const FALLBACK_BUTTONS: [(u8, u32); 14] = [
+const FALLBACK_BUTTONS: [(u8, u32); 15] = [
     (0x1B, MENU), // Esc
     (0x09, VIEW), // Tab
     (0x0D, A),    // Enter
     (0x08, B),    // Backspace
+    (b'O', B),    // Circle, for PlayStation players
     (b'X', X),
     (b'Y', Y),
     (0x26, UP), // arrows
@@ -93,6 +94,18 @@ struct PadState {
     right_y: f32,
 }
 
+/// Motor speeds for one pad, each 0 (off) to `u16::MAX` (full), in the
+/// order of the title's four rumble levels.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Motors {
+    /// Low frequency, in the left grip.
+    low: u16,
+    /// High frequency, in the right grip.
+    high: u16,
+    left_trigger: u16,
+    right_trigger: u16,
+}
+
 /// One key held down: scan code (0xE0xx when extended), character, key.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -111,8 +124,9 @@ trait Source: Send {
     fn pad(&mut self, slot: usize) -> Option<PadState>;
     /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self) -> Vec<KeyState>;
-    /// Motor speeds: low frequency (left), high frequency (right).
-    fn rumble(&mut self, slot: usize, low: u16, high: u16);
+    /// Motor speeds for the pad in host slot `slot`; a host without
+    /// trigger motors drops those two.
+    fn rumble(&mut self, slot: usize, motors: Motors);
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
@@ -525,7 +539,7 @@ fn host() -> Box<dyn Source> {
         fn keys(&mut self) -> Vec<KeyState> {
             Vec::new()
         }
-        fn rumble(&mut self, _: usize, _: u16, _: u16) {}
+        fn rumble(&mut self, _: usize, _: Motors) {}
     }
     Box::new(Nothing)
 }
@@ -908,24 +922,28 @@ extern "system" fn device_status(this: *const Device) -> u32 {
         0
     }
 }
-// shortcut: trigger motors are dropped (XInput has none). The host API that
-// drives them without a redistributable is Windows.Gaming.Input (WinRT
-// `Gamepad.Vibration`), which needs WinRT bindings this crate lacks outside
-// diagnostics builds; Grand Theft Auto VI sends trigger levels in slot 0x50.
+// Grand Theft Auto VI sends trigger levels in slot 0x50; all four reach the
+// host, which drops the trigger motors (see `host::Host::rumble`).
 extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     // SAFETY: one of our devices.
     let device = unsafe { &*this };
     if device.index >= PADS {
         return;
     }
-    let [low, high, ..] = if params.is_null() {
+    let [low, high, left_trigger, right_trigger] = if params.is_null() {
         [0.0; 4]
     } else {
         // SAFETY: checked non-null; four motor levels.
         unsafe { *params }
     };
     let speed = |level: f32| (level.clamp(0.0, 1.0) * f32::from(u16::MAX)) as u16;
-    lock(&device.hub().source).rumble(device.index, speed(low), speed(high));
+    let motors = Motors {
+        low: speed(low),
+        high: speed(high),
+        left_trigger: speed(left_trigger),
+        right_trigger: speed(right_trigger),
+    };
+    lock(&device.hub().source).rumble(device.index, motors);
 }
 extern "system" fn unsupported<const SLOT: usize>(_: *const c_void) -> HRESULT {
     tracing::warn!(
@@ -1134,17 +1152,32 @@ mod host {
 
     impl Source for Host {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
-            if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
-                return None;
-            }
-            let mut state = XINPUT_STATE::default();
-            // SAFETY: room for the state.
-            if unsafe { XInputGetState(slot as u32, &mut state) } != 0 {
+            let empty = self.empty_until[slot].is_some_and(|until| Instant::now() < until);
+            if !empty {
+                let mut state = XINPUT_STATE::default();
+                // SAFETY: room for the state.
+                if unsafe { XInputGetState(slot as u32, &mut state) } == 0 {
+                    self.empty_until[slot] = None;
+                    return Some(convert(&state.Gamepad));
+                }
                 self.empty_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);
-                return None;
             }
-            self.empty_until[slot] = None;
-            Some(convert(&state.Gamepad))
+            // A DualSense is a HID device, not an XInput one; it plays slot 0
+            // when no XInput pad answers there.
+            if slot == 0
+                && let Some(pad) = super::super::dualsense::latest()
+            {
+                return Some(PadState {
+                    buttons: pad.buttons,
+                    left_trigger: pad.left_trigger,
+                    right_trigger: pad.right_trigger,
+                    left_x: pad.left_x,
+                    left_y: pad.left_y,
+                    right_x: pad.right_x,
+                    right_y: pad.right_y,
+                });
+            }
+            None
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
@@ -1174,10 +1207,14 @@ mod host {
                 .collect()
         }
 
-        fn rumble(&mut self, slot: usize, low: u16, high: u16) {
+        // shortcut: trigger motors are dropped (XInput has none). The host
+        // API that drives them without a redistributable is
+        // Windows.Gaming.Input (WinRT `Gamepad.Vibration`), which needs WinRT
+        // bindings this crate lacks outside diagnostics builds.
+        fn rumble(&mut self, slot: usize, motors: Motors) {
             let speeds = XINPUT_VIBRATION {
-                wLeftMotorSpeed: low,
-                wRightMotorSpeed: high,
+                wLeftMotorSpeed: motors.low,
+                wRightMotorSpeed: motors.high,
             };
             // SAFETY: a valid vibration; an empty slot just fails.
             unsafe { XInputSetState(slot as u32, &speeds) };
@@ -1270,7 +1307,7 @@ mod tests {
     struct FakeHost {
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
-        rumble: Vec<(usize, u16, u16)>,
+        rumble: Vec<(usize, Motors)>,
     }
 
     struct Fake(Arc<Mutex<FakeHost>>);
@@ -1282,8 +1319,8 @@ mod tests {
         fn keys(&mut self) -> Vec<KeyState> {
             self.0.lock().unwrap().keys.clone()
         }
-        fn rumble(&mut self, slot: usize, low: u16, high: u16) {
-            self.0.lock().unwrap().rumble.push((slot, low, high));
+        fn rumble(&mut self, slot: usize, motors: Motors) {
+            self.0.lock().unwrap().rumble.push((slot, motors));
         }
     }
 
@@ -1610,6 +1647,40 @@ mod tests {
         rumble(device, &[0.5, 1.0, 1.0, 1.0]);
         rumble(&hub.devices[FALLBACK], &[1.0; 4]);
         rumble(device, std::ptr::null());
-        assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
+        let full = Motors {
+            low: 32767,
+            high: 65535,
+            left_trigger: 65535,
+            right_trigger: 65535,
+        };
+        assert_eq!(
+            host.lock().unwrap().rumble,
+            [(2, full), (2, Motors::default())]
+        );
+    }
+
+    #[test]
+    fn trigger_rumble_reaches_the_host() {
+        let (hub, host) = fake();
+        host.lock().unwrap().pads[1] = Some(PadState::default());
+        hub.poll();
+        let device = &hub.devices[1] as *const Device;
+        type Rumble = extern "system" fn(*const Device, *const [f32; 4]);
+        let rumble = slot::<Rumble, _>(device, 0x50);
+        // Out-of-range and NaN levels clamp or fall to off, like the grips.
+        rumble(device, &[0.0, 0.0, 0.25, 2.0]);
+        rumble(device, &[0.0, 0.0, -1.0, f32::NAN]);
+        let expected = [
+            (
+                1,
+                Motors {
+                    left_trigger: 16383,
+                    right_trigger: 65535,
+                    ..Motors::default()
+                },
+            ),
+            (1, Motors::default()),
+        ];
+        assert_eq!(host.lock().unwrap().rumble, expected);
     }
 }

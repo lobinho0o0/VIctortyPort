@@ -236,7 +236,7 @@ pub(super) const SOPP: &[(u16, &str)] = &[
     (0x023, "s_waitcnt_depctr"),
     (0x024, "s_round_mode"),
     (0x025, "s_denorm_mode"),
-    (0x026, "s_ttracedata_imm"),
+    (0x028, "s_ttracedata_imm"),
 ];
 
 pub(super) const SMEM: &[(u16, &str)] = &[
@@ -332,7 +332,9 @@ pub(super) const VOP2: &[(u16, &str)] = &[
     (0x003, "v_add_f32"),
     (0x004, "v_sub_f32"),
     (0x005, "v_subrev_f32"),
-    (0x006, "v_mac_legacy_f32"),
+    // GFX10.3 fuses the legacy multiply-adds of GFX10.1 (Mesa's GFX10
+    // column has the older names): AMD's RDNA2 ISA, LLVM's gfx1030 tables.
+    (0x006, "v_fmac_legacy_f32"),
     (0x007, "v_mul_legacy_f32"),
     (0x008, "v_mul_f32"),
     (0x009, "v_mul_i32_i24"),
@@ -657,7 +659,7 @@ pub(super) const VOPC: &[(u16, &str)] = &[
 ];
 
 pub(super) const VOP3: &[(u16, &str)] = &[
-    (0x140, "v_mad_legacy_f32"),
+    (0x140, "v_fma_legacy_f32"),
     (0x141, "v_mad_f32"),
     (0x142, "v_mad_i32_i24"),
     (0x143, "v_mad_u32_u24"),
@@ -1313,3 +1315,21 @@ pub(super) const SCRATCH: &[(u16, &str)] = &[
     (0x024, "scratch_load_short_d16"),
     (0x025, "scratch_load_short_d16_hi"),
 ];
+
+#[cfg(test)]
+mod tests {
+    fn bytes(words: &[u32]) -> Vec<u8> {
+        words.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    /// `s_ttracedata_imm 0x1234` as LLVM's GFX10 disassembler tests have it
+    /// (`gfx10_sopp.txt`: `0x34,0x12,0xa8,0xbf`), SOPP opcode 0x28 as in
+    /// AMD's RDNA2 ISA. A thread-trace marker, which translation drops.
+    #[test]
+    fn s_ttracedata_imm_is_sopp_0x28() {
+        let code = bytes(&[0xBFA8_1234, 0xBF81_0000]);
+        let decoded = super::super::decode(&code).unwrap();
+        assert_eq!(decoded[0].name(), Some("s_ttracedata_imm"));
+        assert!(crate::ir::build(&code, false, 1).is_ok());
+    }
+}

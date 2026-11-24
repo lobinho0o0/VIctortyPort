@@ -12,13 +12,20 @@ pub const SAMPLER_SPACE: u32 = 0;
 /// Where root CBVs and SRVs are bound: `b<root parameter index>` and
 /// `t<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
+/// Where the host's runtime stride table is bound: `t0` in this space
+/// (one `u32` element stride per view-heap slot).
+pub const STRIDE_SPACE: u32 = 2;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     pub const WAVE_OPS: u64 = 1 << 19;
+    pub const BARYCENTRICS: u64 = 1 << 22;
     pub const INT64: u64 = 1 << 20;
+    pub const ATOMIC_TYPED64: u64 = 1 << 27;
+    pub const ATOMIC_INT64_GROUP_SHARED: u64 = 1 << 28;
+    pub const ATOMIC_HEAP64: u64 = 1 << 32;
     pub const RESOURCE_HEAP: u64 = 1 << 30;
     pub const SAMPLER_HEAP: u64 = 1 << 31;
 }
@@ -46,6 +53,9 @@ pub(crate) struct Mesh {
 
 pub(crate) struct Shader {
     pub m: Module,
+    /// Test builds: the property words of each handle annotation, in order.
+    #[cfg(test)]
+    pub annotations: Vec<(u32, u32)>,
     pub t: Types,
     pub pixel: bool,
     pub inputs: Vec<SigElement>,
@@ -64,7 +74,11 @@ pub(crate) struct Shader {
     pub root_cbvs: Vec<(u8, V)>,
     /// Root SRVs (raw buffers) read, likewise.
     pub root_srvs: Vec<(u8, V)>,
+    /// Handle of the runtime stride table (`t0`, [`STRIDE_SPACE`]), if read.
+    pub stride_table: Option<V>,
     pub flags: u64,
+    /// Heap handles made with a non-uniform index.
+    pub nonuniform_handles: u32,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -96,6 +110,8 @@ impl Shader {
         let entry = m.new_block();
         Shader {
             m,
+            #[cfg(test)]
+            annotations: Vec::new(),
             t: Types {
                 void,
                 i1,
@@ -117,7 +133,9 @@ impl Shader {
             cmp_samplers: 0,
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            stride_table: None,
             flags: 0,
+            nonuniform_handles: 0,
             threads: None,
             wave_size: None,
             lds_dwords: 0,
@@ -127,14 +145,21 @@ impl Shader {
         }
     }
 
-    /// The thread-group shared memory: `[lds_dwords x i32]` in address
-    /// space 3.
-    pub fn lds(&mut self) -> V {
+    /// The single LDS allocation in address space 3.
+    pub fn lds(&mut self, wide: bool) -> V {
         if let Some(g) = self.lds {
             return g;
         }
-        let arr = self.m.array(self.lds_dwords, self.t.i32);
+        let arr = if wide {
+            let i64t = self.m.int(64);
+            self.m.array(self.lds_dwords.div_ceil(2), i64t)
+        } else {
+            self.m.array(self.lds_dwords, self.t.i32)
+        };
         let g = self.m.global("lds", arr, 3);
+        if wide {
+            self.m.align_global_to_eight(g);
+        }
         self.lds = Some(g);
         g
     }
@@ -232,6 +257,32 @@ impl Shader {
         h
     }
 
+    /// The handle of the host's runtime stride table (`t0` in
+    /// [`STRIDE_SPACE`], a raw buffer of `u32` byte strides indexed by
+    /// view-heap slot).
+    pub fn stride_table_handle(&mut self) -> V {
+        if let Some(h) = self.stride_table {
+            return h;
+        }
+        let z = self.m.i32(0);
+        let bind = [z, z, self.m.i32(STRIDE_SPACE), self.m.i8(0)];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let block = self.entry;
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, z, f],
+        );
+        let h = self.annotate(block, h, 11, 0);
+        self.flags |= flags::RAW_BUFFERS;
+        self.stride_table = Some(h);
+        h
+    }
+
     /// The handle of immediate sampler `n` (a comparison sampler when its
     /// bit in `cmp_samplers` is set).
     pub fn sampler_handle(&mut self, block: usize, n: u32) -> V {
@@ -260,6 +311,8 @@ impl Shader {
     }
 
     pub fn annotate(&mut self, block: usize, h: V, props0: u32, props1: u32) -> V {
+        #[cfg(test)]
+        self.annotations.push((props0, props1));
         let p = [self.m.i32(props0), self.m.i32(props1)];
         let p = self.m.aggregate(self.t.props, &p);
         self.op(
@@ -272,14 +325,23 @@ impl Shader {
         )
     }
 
-    /// A descriptor heap handle, annotated with `props`.
-    pub fn heap_handle(&mut self, block: usize, index: V, sampler: bool, props: (u32, u32)) -> V {
+    /// A descriptor heap handle, annotated with `props`; `nonuniform` when
+    /// the index may differ between lanes (`NonUniformResourceIndex`).
+    pub fn heap_handle(
+        &mut self,
+        block: usize,
+        index: V,
+        sampler: bool,
+        nonuniform: bool,
+        props: (u32, u32),
+    ) -> V {
         self.flags |= if sampler {
             flags::SAMPLER_HEAP
         } else {
             flags::RESOURCE_HEAP
         };
-        let (s, n) = (self.m.bool(sampler), self.m.bool(false));
+        self.nonuniform_handles += u32::from(nonuniform);
+        let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
             block,
             "createHandleFromHeap",
@@ -305,6 +367,7 @@ impl Shader {
             || self.samplers > 0
             || !self.root_cbvs.is_empty()
             || !self.root_srvs.is_empty()
+            || self.stride_table.is_some()
         {
             let empty = self.m.md_str("");
             let mut cbvs = None;
@@ -359,20 +422,28 @@ impl Shader {
                 cbvs = Some(self.m.md_node(cbv_list));
             }
             let mut srvs = None;
-            if !self.root_srvs.is_empty() {
+            if !self.root_srvs.is_empty() || self.stride_table.is_some() {
+                let mut specs: Vec<(u32, u32)> = self
+                    .root_srvs
+                    .iter()
+                    .map(|&(slot, _)| (ROOT_CBV_SPACE, u32::from(slot)))
+                    .collect();
+                if self.stride_table.is_some() {
+                    specs.push((STRIDE_SPACE, 0));
+                }
                 let ty = self
                     .m
                     .named_struct("struct.ByteAddressBuffer", vec![self.t.i32]);
                 let p = self.m.ptr(ty);
                 let u = self.m.undef(p);
                 let mut list = Vec::new();
-                for (n, (slot, _)) in self.root_srvs.clone().into_iter().enumerate() {
+                for (n, (space, reg)) in specs.into_iter().enumerate() {
                     let ops = vec![
                         Some(i32c(&mut self, n as u32)),
                         Some(self.m.md_value(u)),
                         Some(empty),
-                        Some(i32c(&mut self, ROOT_CBV_SPACE)),
-                        Some(i32c(&mut self, u32::from(slot))),
+                        Some(i32c(&mut self, space)),
+                        Some(i32c(&mut self, reg)),
                         Some(i32c(&mut self, 1)),
                         Some(i32c(&mut self, 11)),
                         Some(i32c(&mut self, 0)),
@@ -381,8 +452,8 @@ impl Shader {
                     list.push(Some(self.m.md_node(ops)));
                     bindings.push(Binding {
                         kind: 4,
-                        space: ROOT_CBV_SPACE,
-                        register: u32::from(slot),
+                        space,
+                        register: reg,
                         dxil_kind: 11,
                     });
                 }
@@ -558,11 +629,23 @@ impl Shader {
         if self.flags & flags::INT64 != 0 {
             features |= 0x8000;
         }
+        if self.flags & flags::BARYCENTRICS != 0 {
+            features |= 0x2_0000;
+        }
         if self.flags & flags::RESOURCE_HEAP != 0 {
             features |= 0x200_0000;
         }
         if self.flags & flags::SAMPLER_HEAP != 0 {
             features |= 0x400_0000;
+        }
+        if self.flags & flags::ATOMIC_TYPED64 != 0 {
+            features |= 0x40_0000;
+        }
+        if self.flags & flags::ATOMIC_INT64_GROUP_SHARED != 0 {
+            features |= 0x80_0000;
+        }
+        if self.flags & flags::ATOMIC_HEAP64 != 0 {
+            features |= 0x1000_0000;
         }
         let sfi0 = features.to_le_bytes();
         let isg1 = container::signature(&self.inputs, true);

@@ -615,14 +615,24 @@ impl Lane {
 
 /// Staging bytes a request holds while it runs: what it buffers between
 /// the file and the destination. Raw reads go straight to their
-/// destination, memory sources need none (as on the console).
+/// destination, memory sources need none (as on the console). Also counted:
+/// the zlib output a BCPack decode reads, and the whole destination of a
+/// physical-page request, which are buffered here too (each worker holds
+/// all three at once, so leaving them out let loading hold far more than
+/// [`STAGING`]).
 fn staging_bytes(request: &Request) -> u64 {
+    let mut bytes = 0;
     let buffered = request.options & (ZLIB | BCPACK | PAGE_DESTINATION) != 0;
     if buffered && request.options & MEMORY_SOURCE == 0 {
-        u64::from(request.source_size)
-    } else {
-        0
+        bytes += u64::from(request.source_size);
     }
+    if request.options & ZLIB != 0 && request.options & BCPACK != 0 {
+        bytes += u64::from(request.intermediate_size);
+    }
+    if request.options & PAGE_DESTINATION != 0 {
+        bytes += u64::from(request.destination_size);
+    }
+    bytes
 }
 
 /// Ends a queue: what was not started is dropped, and this waits for the

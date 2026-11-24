@@ -62,10 +62,66 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
+/// The hardware adapters, in DXGI's order: each one's description.
+pub fn adapters() -> Result<Vec<String>, String> {
+    // SAFETY: plain DXGI calls.
+    unsafe {
+        let factory: IDXGIFactory1 = CreateDXGIFactory1().map_err(err)?;
+        let mut out = Vec::new();
+        let mut i = 0;
+        while let Ok(a) = factory.EnumAdapters1(i) {
+            let d = a.GetDesc1().map_err(err)?;
+            if d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
+                out.push(description(&d.Description));
+            }
+            i += 1;
+        }
+        Ok(out)
+    }
+}
+
+fn description(wide: &[u16]) -> String {
+    let n = wide.iter().position(|&c| c == 0).unwrap_or(wide.len());
+    String::from_utf16_lossy(&wide[..n])
+}
+
 impl Host {
-    /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
+    /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`), or
+    /// the first hardware adapter whose description holds
+    /// `VICTORY_ADAPTER` (ignoring case: `nvidia`, `radeon`...).
     pub fn new(warp: bool) -> Result<Self, String> {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+        match std::env::var("VICTORY_ADAPTER") {
+            Ok(name) if !warp && !name.is_empty() => Self::on(&name),
+            _ => Self::create(warp, None),
+        }
+    }
+
+    /// The first hardware adapter whose description holds `name`,
+    /// ignoring case.
+    pub fn on(name: &str) -> Result<Self, String> {
+        let want = name.to_lowercase();
+        // SAFETY: plain DXGI calls.
+        let adapter = unsafe {
+            let factory: IDXGIFactory1 = CreateDXGIFactory1().map_err(err)?;
+            let mut i = 0;
+            loop {
+                let a = factory
+                    .EnumAdapters1(i)
+                    .map_err(|_| format!("no adapter named {name:?}"))?;
+                let d = a.GetDesc1().map_err(err)?;
+                if d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0
+                    && description(&d.Description).to_lowercase().contains(&want)
+                {
+                    break a;
+                }
+                i += 1;
+            }
+        };
+        Self::create(false, Some(adapter.cast().map_err(err)?))
+    }
+
+    fn create(warp: bool, adapter: Option<IDXGIAdapter>) -> Result<Self, String> {
         // SAFETY: plain D3D12/DXGI calls with valid out pointers.
         unsafe {
             let mut device: Option<ID3D12Device> = None;
@@ -74,6 +130,8 @@ impl Host {
                     CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
                 let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
                 D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+            } else if let Some(adapter) = &adapter {
+                D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             } else {
                 D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             }
@@ -95,6 +153,30 @@ impl Host {
                 ));
             }
             Ok(Host { device })
+        }
+    }
+
+    /// The wave sizes the device runs ([`super::Target::ANY`] if it does
+    /// not say).
+    pub fn target(&self) -> super::Target {
+        let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: the query writes the structure of the given size.
+        let ok = unsafe {
+            self.device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS1,
+                    (&raw mut o).cast(),
+                    size_of_val(&o) as u32,
+                )
+                .is_ok()
+        };
+        if ok && o.WaveOps.as_bool() && o.WaveLaneCountMin > 0 {
+            super::Target {
+                lanes_min: o.WaveLaneCountMin,
+                lanes_max: o.WaveLaneCountMax,
+            }
+        } else {
+            super::Target::ANY
         }
     }
 
@@ -152,6 +234,19 @@ impl Host {
                     Descriptor: D3D12_ROOT_DESCRIPTOR1 {
                         ShaderRegister: u32::from(slot),
                         RegisterSpace: super::ROOT_CBV_SPACE,
+                        Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            });
+        }
+        if stages.iter().any(|(s, _)| s.stride_table) {
+            params.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                        ShaderRegister: 0,
+                        RegisterSpace: super::STRIDE_SPACE,
                         Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
                     },
                 },
@@ -528,6 +623,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
+        stride_table: false,
     }
 }
 
@@ -912,8 +1008,15 @@ pub enum View<'a> {
     Texture(u32, u32, &'a [[f32; 4]]),
     /// An RGBA32F cube SRV (face size, texels of faces +x -x +y -y +z -z).
     Cube(u32, &'a [[f32; 4]]),
+    /// An RGBA32F texture SRV with mip levels (width, height, levels,
+    /// texels of each level in turn, level n `max(1, size >> n)` wide).
+    Levels(u32, u32, u32, &'a [[f32; 4]]),
+    /// An R32F texture SRV (width, height, texels), for comparison sampling.
+    Depth(u32, u32, &'a [f32]),
     /// A raw buffer UAV of this many dwords, zeroed.
     RawUav(u32),
+    /// A structured buffer UAV (element count, stride in bytes).
+    StructuredUav(u32, u32),
     /// An RGBA32F texture UAV (width, height), zeroed.
     TextureUav(u32, u32),
     /// An R32_UINT texture UAV (width, height), zeroed (atomics).
@@ -1152,17 +1255,78 @@ impl Host {
                         );
                         keep.push(tex);
                     }
-                    View::RawUav(_) | View::HalfUav(_) => {
-                        // (dwords, format, elements, flags)
-                        let (n, format, elements, flags) = match *v {
+                    View::Levels(..) | View::Depth(..) => {
+                        // (width, height, levels, format, texel bytes, texel data)
+                        let (w, h, levels, format, size, bytes) = match *v {
+                            View::Levels(w, h, n, t) => {
+                                let b = std::slice::from_raw_parts(t.as_ptr().cast(), t.len() * 16);
+                                (w, h, n, DXGI_FORMAT_R32G32B32A32_FLOAT, 16, b)
+                            }
+                            View::Depth(w, h, t) => {
+                                let b = std::slice::from_raw_parts(t.as_ptr().cast(), t.len() * 4);
+                                (w, h, 1, DXGI_FORMAT_R32_FLOAT, 4, b)
+                            }
+                            _ => unreachable!(),
+                        };
+                        let mut desc = texture_as(w, h, D3D12_RESOURCE_FLAG_NONE, format);
+                        desc.MipLevels = levels as u16;
+                        let tex = make(
+                            D3D12_HEAP_TYPE_DEFAULT,
+                            &desc,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        let mut from = 0;
+                        for level in 0..levels {
+                            let (lw, lh) =
+                                ((w >> level).max(1) as usize, (h >> level).max(1) as usize);
+                            let pitch = (lw * size).next_multiple_of(256);
+                            let upload = make(
+                                D3D12_HEAP_TYPE_UPLOAD,
+                                &buffer((pitch * lh) as u64, D3D12_RESOURCE_FLAG_NONE),
+                                D3D12_RESOURCE_STATE_GENERIC_READ,
+                            )?;
+                            let mut p = std::ptr::null_mut();
+                            upload.Map(0, None, Some(&mut p)).map_err(err)?;
+                            for y in 0..lh {
+                                std::ptr::copy_nonoverlapping(
+                                    bytes[from + y * lw * size..].as_ptr(),
+                                    p.cast::<u8>().add(y * pitch),
+                                    lw * size,
+                                );
+                            }
+                            from += lw * lh * size;
+                            upload.Unmap(0, None);
+                            let mut src = footprint(&upload, lw as u32, lh as u32);
+                            src.Anonymous.PlacedFootprint.Footprint.Format = format;
+                            src.Anonymous.PlacedFootprint.Footprint.RowPitch = pitch as u32;
+                            let mut dst = subresource(&tex);
+                            dst.Anonymous.SubresourceIndex = level;
+                            list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+                            keep.push(upload);
+                        }
+                        list.ResourceBarrier(&[transition(
+                            &tex,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        )]);
+                        dev.CreateShaderResourceView(&tex, None, at);
+                        keep.push(tex);
+                    }
+                    View::RawUav(_) | View::StructuredUav(_, _) | View::HalfUav(_) => {
+                        let (n, format, elements, stride, flags) = match *v {
                             View::HalfUav(e) => (
                                 2 * e,
                                 DXGI_FORMAT_R16G16B16A16_FLOAT,
                                 e,
+                                0,
+                                D3D12_BUFFER_UAV_FLAG_NONE,
+                            ),
+                            View::StructuredUav(e, stride) => (
+                                e * stride / 4, DXGI_FORMAT_UNKNOWN, e, stride,
                                 D3D12_BUFFER_UAV_FLAG_NONE,
                             ),
                             View::RawUav(n) => {
-                                (n, DXGI_FORMAT_R32_TYPELESS, n, D3D12_BUFFER_UAV_FLAG_RAW)
+                                (n, DXGI_FORMAT_R32_TYPELESS, n, 0, D3D12_BUFFER_UAV_FLAG_RAW)
                             }
                             _ => unreachable!(),
                         };
@@ -1178,6 +1342,7 @@ impl Host {
                             Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
                                 Buffer: D3D12_BUFFER_UAV {
                                     NumElements: elements,
+                                    StructureByteStride: stride,
                                     Flags: flags,
                                     ..Default::default()
                                 },
