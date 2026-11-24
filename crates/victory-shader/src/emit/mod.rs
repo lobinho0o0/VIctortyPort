@@ -228,11 +228,21 @@ pub fn emit(
     let mut inputs = sig(FourCC::ISG1)?;
     let mut outputs = sig(FourCC::OSG1)?;
     // Interpolation as DXC declares it by default; pixel inputs that are
-    // read get the mode their barycentrics say.
+    // read get the mode their barycentrics say. Conservative depth outputs
+    // (`SV_DepthGreaterEqual`/`SV_DepthLessEqual`, kinds 18/19) require
+    // `SV_Position` to use `linear_noperspective_centroid` (5) rather than
+    // `linear_noperspective` (4) unless the shader runs at sample frequency.
+    let conservative_depth = pixel && outputs.iter().any(|o| matches!(o.kind, 18 | 19));
     let interpolated = if pixel { &mut inputs } else { &mut outputs };
-    for e in interpolated {
+    for e in interpolated.iter_mut() {
         e.interp = match (e.kind, e.comp) {
-            (3, _) => 4,
+            (3, _) => {
+                if conservative_depth {
+                    5
+                } else {
+                    4
+                }
+            }
             // Constant, as DXC declares it (the AMD compiler crashed on a
             // front face without a mode).
             (13, _) => 1,
@@ -241,6 +251,7 @@ pub fn emit(
             _ => 0,
         };
     }
+    harmonize_row_interp(interpolated);
     // Per-primitive outputs are constant. The console never exports a
     // primitive id or cull flag a mesh shader writes (it culls with the
     // primitive export), so those rows are left out.
@@ -297,6 +308,37 @@ pub fn emit(
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
     })
+}
+
+/// DXIL requires every signature element packed into the same row to share an
+/// interpolation mode. Integer attributes and `SV_IsFrontFace` can only be
+/// `Constant` (1), so any float sibling packed into their row must be `1` as
+/// well; after pixel-shader lowering, unread siblings also inherit the actual
+/// interpolation mode of a read element in the same row.
+pub(super) fn harmonize_row_interp(elements: &mut [container::SigElement]) {
+    let mut rows: Vec<u32> = elements.iter().filter_map(|e| e.row).collect();
+    rows.sort_unstable();
+    rows.dedup();
+    for row in rows {
+        let forced_constant = elements
+            .iter()
+            .any(|e| e.row == Some(row) && (e.kind == 13 || (e.kind == 0 && e.comp != 9)));
+        let mode = if forced_constant {
+            Some(1)
+        } else {
+            elements
+                .iter()
+                .find(|e| e.row == Some(row) && e.usage != 0 && e.interp != 0)
+                .map(|e| e.interp)
+        };
+        if let Some(m) = mode {
+            for e in elements.iter_mut() {
+                if e.row == Some(row) && e.interp != 0 && e.usage == 0 {
+                    e.interp = m;
+                }
+            }
+        }
+    }
 }
 
 /// The rows of an `ISG1`/`OSG1` part.
@@ -593,5 +635,388 @@ mod tests {
         let st = crate::structure::structure(&p).unwrap();
         // Translated or refused with a reason; it must not panic.
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
+    }
+
+    #[cfg(windows)]
+    fn validate_if_available(dxil: &[u8]) {
+        let path = super::validator::Validator::default_path();
+        let Ok(mut v) = super::validator::Validator::load(path.as_deref()) else {
+            eprintln!("no dxil.dll; skipped");
+            return;
+        };
+        let mut copy = dxil.to_vec();
+        let ours = copy[4..20].to_vec();
+        v.validate(&mut copy)
+            .unwrap_or_else(|e| panic!("dxil.dll rejected shader:\n{e}"));
+        assert_eq!(copy[4..20], ours[..], "container hash disagrees");
+    }
+
+    fn emit_synthetic(
+        parts: &[(FourCC, &[u8])],
+        native: &NativeProgram,
+    ) -> Result<HostShader, ShaderError> {
+        let bytes = crate::dxbc::build(parts);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = io::raise(&p, native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        emit(&c, native, &p, &st, &io, &res)
+    }
+
+    fn sig_elem(
+        name: &str,
+        index: u32,
+        kind: u8,
+        comp: u8,
+        row: Option<u32>,
+        col: u8,
+        cols: u8,
+    ) -> SigElement {
+        SigElement {
+            name: name.into(),
+            index,
+            kind,
+            comp,
+            interp: 0,
+            row,
+            col,
+            cols,
+            usage: 0,
+            half: false,
+        }
+    }
+
+    #[test]
+    fn conservative_depth_sets_position_centroid_and_validates() {
+        for (depth_name, depth_kind) in
+            [("SV_DepthLessEqual", 18u8), ("SV_DepthGreaterEqual", 19u8)]
+        {
+            // v_mov_b32 v0, 0.5; exp mrtz v0, off, off, off done; s_endpgm
+            let words = [
+                0x7E00_02F0u32, // v_mov_b32 v0, 0.5
+                0xF800_0881,    // exp mrtz (target 8), en=0x1, done=1
+                0x0000_0000,    // vsrc0=v0
+                0xBF81_0000,    // s_endpgm
+            ];
+            let native = NativeProgram {
+                stage: HwStage::Ps,
+                wave64: false,
+                vgprs: 4,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Ps {
+                    inputs: vec![],
+                    input_addr: 0,
+                    db_shader_control: 0,
+                    patches: vec![],
+                },
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let isg1 =
+                container::signature(&[sig_elem("SV_Position", 0, 3, 9, Some(0), 0, 4)], true);
+            let osg1 =
+                container::signature(&[sig_elem(depth_name, 0, depth_kind, 9, None, 0, 1)], false);
+            let host =
+                emit_synthetic(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)], &native).unwrap();
+            #[cfg(windows)]
+            validate_if_available(&host.dxil);
+        }
+    }
+
+    #[test]
+    fn row_interp_harmonizes_packed_elements_and_validates() {
+        // 1) Unit check on harmonize_row_interp for packed uint + float and unread siblings.
+        let mut elems = vec![
+            SigElement {
+                interp: 1,
+                ..sig_elem("COLOR", 1, 0, 5, Some(1), 0, 1)
+            },
+            SigElement {
+                interp: 2,
+                ..sig_elem("COLOR", 2, 0, 9, Some(1), 1, 1)
+            },
+            SigElement {
+                interp: 1,
+                usage: 1,
+                ..sig_elem("TEXCOORD", 0, 0, 9, Some(2), 0, 2)
+            },
+            SigElement {
+                interp: 2,
+                ..sig_elem("TEXCOORD", 1, 0, 9, Some(2), 2, 2)
+            },
+        ];
+        harmonize_row_interp(&mut elems);
+        assert_eq!(elems[1].interp, 1);
+        assert_eq!(elems[3].interp, 1);
+
+        // 2) Full PS with SV_IsFrontFace + unread float in row 1 AND a read
+        //    flat float + unread float in row 2 -> validates with dxil.dll.
+        // v_interp_mov_f32 v0, p0, attr0.x; exp mrt0 v0, v0, v0, v0 done; s_endpgm
+        let words = [
+            0xC802_0002u32, // v_interp_mov_f32 v0, p0, attr0.x
+            0xF800_080F,    // exp mrt0, en=0xF, done=1
+            0x0000_0000,    // vsrc0..3 = v0
+            0xBF81_0000,    // s_endpgm
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![crate::native::PsInput {
+                    usage: crate::native::Usage::Generic,
+                    row: 2,
+                    mask: 0x3,
+                    attr: 0,
+                    flat: true,
+                    fp16: false,
+                    pack2: false,
+                    row2: 0,
+                }],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let isg1 = container::signature(
+            &[
+                sig_elem("SV_Position", 0, 3, 9, Some(0), 0, 4),
+                sig_elem("TEXCOORD", 0, 0, 9, Some(1), 0, 1),
+                sig_elem("SV_IsFrontFace", 0, 13, 5, Some(1), 1, 1),
+                sig_elem("TEXCOORD", 1, 0, 9, Some(2), 0, 2),
+                sig_elem("TEXCOORD", 2, 0, 9, Some(2), 2, 2),
+            ],
+            true,
+        );
+        let osg1 = container::signature(&[sig_elem("SV_Target", 0, 16, 9, Some(0), 0, 4)], false);
+        let host =
+            emit_synthetic(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)], &native).unwrap();
+        #[cfg(windows)]
+        validate_if_available(&host.dxil);
+    }
+
+    #[test]
+    fn signature_part_preserves_element_order_within_row_and_validates() {
+        // Two elements in row 1 where the earlier element has a higher column
+        // (col=3, w) than the later element (col=0, xyz).
+        let row1_elems = [
+            sig_elem("SV_Position", 0, 3, 9, Some(0), 0, 4),
+            sig_elem("TEXCOORD", 3, 0, 9, Some(1), 3, 1),
+            sig_elem("NORMAL", 0, 0, 9, Some(1), 0, 3),
+        ];
+        let isg1 = container::signature(&row1_elems, true);
+        let parsed = signature(&isg1).unwrap();
+        assert_eq!(parsed[1].name, "TEXCOORD");
+        assert_eq!(parsed[2].name, "NORMAL");
+
+        // Validate through full PS emission so dxil.dll verifies ISG1 matches
+        // the DXIL signature metadata byte for byte.
+        // v_mov_b32 v0, 0; exp mrt0 v0, v0, v0, v0 done; s_endpgm
+        let ps_words = [0x7E00_0280u32, 0xF800_080F, 0x0000_0000, 0xBF81_0000];
+        let ps_native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 2,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: ps_words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let osg1 = container::signature(&[sig_elem("SV_Target", 0, 16, 9, Some(0), 0, 4)], false);
+        let ps =
+            emit_synthetic(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)], &ps_native).unwrap();
+        #[cfg(windows)]
+        validate_if_available(&ps.dxil);
+
+        // Also validate a VS whose OSG1 has the same out-of-column row order.
+        // v_mov_b32 v0, 0; exp pos0 v0..v0 done; exp param0 v0..v0; s_endpgm
+        let vs_words = [
+            0x7E00_0280u32,
+            0xF800_00CF, // exp pos0 (target 12), en=0xF
+            0x0000_0000,
+            0xF800_0A0F, // exp param0 (target 32), en=0xF, done=1
+            0x0000_0000,
+            0xBF81_0000,
+        ];
+        let vs_native = NativeProgram {
+            stage: HwStage::Vs,
+            wave64: false,
+            vgprs: 2,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Vs {
+                inputs: vec![],
+                outputs: vec![crate::native::VsOutput {
+                    usage: crate::native::Usage::Generic,
+                    row: 1,
+                    param: 0,
+                    fp16: false,
+                    pack2: false,
+                }],
+            },
+            code: vs_words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let vs_osg1 = container::signature(&row1_elems, false);
+        let vs = emit_synthetic(&[(FourCC::OSG1, &vs_osg1)], &vs_native).unwrap();
+        #[cfg(windows)]
+        validate_if_available(&vs.dxil);
+    }
+
+    #[test]
+    fn compute_shader_implicit_sample_uses_valver_1_8_and_validates() {
+        // Synthetic CS (8x8x1): loads a 2D texture SRV from a root table (s0)
+        // and samples it with an immediate sampler (s[8:11]) via `image_sample`.
+        // s_load_dwordx8 s[0:7], s[12:13], 0x0 (table in s12)
+        // Wait: in resource::track, a 1-SGPR table pointer uses s_load_dwordx8
+        // from s[0:1] when layout has RootType::Table at user_data=0!
+        // Encode:
+        //   s_mov_b32 s1, 0             (high half of 64-bit table base)
+        //   s_load_dwordx8 s[4:11], s[0:1], 0x0
+        //   s_mov_b32 s12, 0; s_mov_b32 s13, 0; s_mov_b32 s14, 0; s_mov_b32 s15, 0
+        //   v_mov_b32 v0, 0.5; v_mov_b32 v1, 0.5
+        //   image_sample v0, v[0:1], s[4:11], s[12:15] dmask:0x1 dim:SQ_RSRC_IMG_2D
+        //   s_endpgm
+        let words = [
+            0xBE81_0380u32, // s_mov_b32 s1, 0
+            0xF40C_0100,    // s_load_dwordx8 s[4:11], s[0:1], 0
+            0xFA00_0000,    // soffset=NULL, offset=0
+            0xBE8C_0380,    // s_mov_b32 s12, 0
+            0xBE8D_0380,    // s_mov_b32 s13, 0
+            0xBE8E_0380,    // s_mov_b32 s14, 0
+            0xBE8F_0380,    // s_mov_b32 s15, 0
+            0x7E00_02F0,    // v_mov_b32 v0, 0.5
+            0x7E02_02F0,    // v_mov_b32 v1, 0.5
+            // MIMG image_sample (op=0x20): w0 = 0xF000_0000 | (0x20 << 18) | (1 << 8) | (1 << 3)
+            0xF080_0108,
+            // w1: vaddr=v0, vdata=v0, srsrc=s[4:11] (1), ssamp=s[12:15] (3)
+            (3 << 21) | (1 << 16),
+            0xBF81_0000, // s_endpgm
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![crate::native::RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![crate::native::UsedResource {
+                kind: crate::native::ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 8,
+                dwords: 8,
+                user_data: 0,
+                slot: 0,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 0,
+                threads: [8, 8, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let cs = emit_synthetic(&[], &native).unwrap();
+        // PSV0 must use RuntimeInfo3 (52 bytes) for validator 1.8.
+        let parsed = Container::parse(&cs.dxil).unwrap();
+        let psv0 = parsed.part(FourCC::PSV0).unwrap().data;
+        assert_eq!(crate::dxbc::u32_at(psv0, 0).unwrap(), 52);
+        #[cfg(windows)]
+        {
+            validate_if_available(&cs.dxil);
+            if let Ok(host) = super::host::Host::new(false) {
+                host.compute_pipeline(&cs).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn biased_16bit_image_sample_unpacks_f16_bias_and_f16_coords_and_validates() {
+        // Synthetic PS executing `image_sample_b v0, v[1:2], s[4:11], s[12:15]
+        // dmask:0x1 dim:SQ_RSRC_IMG_2D a16` where v1 holds an f16 bias (-1.0)
+        // in its low half (the high half is ignored, as the hardware does) and
+        // v2 holds packed f16 (u, v) = (0.5, 0.5), then exporting v0.
+        let words = [
+            0xBE81_0380u32, // s_mov_b32 s1, 0
+            0xF40C_0100,    // s_load_dwordx8 s[4:11], s[0:1], 0
+            0xFA00_0000,    // soffset=NULL, offset=0
+            0xBE8C_0380,    // s_mov_b32 s12, 0
+            0xBE8D_0380,    // s_mov_b32 s13, 0
+            0xBE8E_0380,    // s_mov_b32 s14, 0
+            0xBE8F_0380,    // s_mov_b32 s15, 0
+            0x7E02_02FF,    // v_mov_b32 v1, lit(0x5A5A_BC00)
+            0x5A5A_BC00,    // f16 -1.0 bias in the low half
+            0x7E04_02FF,    // v_mov_b32 v2, lit(0x3800_3800) (packed f16 0.5, 0.5)
+            0x3800_3800,
+            // MIMG image_sample_b (op=0x25): dmask=0x1, dim=1 (2D), a16=1 (bit 30 of w1)
+            0xF000_0000 | (0x25 << 18) | (1 << 8) | (1 << 3),
+            (1 << 30) | (3 << 21) | (1 << 16) | 1, // vaddr=v1 (v[1:2]), vdata=v0
+            0xF800_080F,                           // exp mrt0 v0, v0, v0, v0 done
+            0x0000_0000,
+            0xBF81_0000, // s_endpgm
+        ];
+        // Sanity-check the synthetic encoding decodes as `image_sample_b ... a16`.
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let decoded = crate::gfx10::decode(&code).unwrap();
+        let sample = decoded
+            .iter()
+            .find(|i| i.name() == Some("image_sample_b"))
+            .expect("image_sample_b decoded");
+        assert!(matches!(
+            sample.fields(false),
+            crate::gfx10::Fields::Image {
+                a16: true,
+                dim: 1,
+                ..
+            }
+        ));
+
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![crate::native::RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![crate::native::UsedResource {
+                kind: crate::native::ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 8,
+                dwords: 8,
+                user_data: 0,
+                slot: 0,
+            }],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code,
+        };
+        let osg1 = container::signature(&[sig_elem("SV_Target", 0, 16, 9, Some(0), 0, 4)], false);
+        let ps = emit_synthetic(&[(FourCC::OSG1, &osg1)], &native).unwrap();
+        #[cfg(windows)]
+        validate_if_available(&ps.dxil);
     }
 }

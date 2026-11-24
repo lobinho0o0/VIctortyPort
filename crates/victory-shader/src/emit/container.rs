@@ -71,7 +71,8 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     // Validator 1.6 writes one name per element in element order, repeats
     // included, except that system values share theirs (it keys names by
     // the semantic's string, which is one static string per system value);
-    // the rows sorted by register (unallocated last).
+    // the rows are stably sorted by register (unallocated last), preserving
+    // element order within a row.
     let mut offsets: Vec<u32> = Vec::new();
     let mut next = 8 + 32 * elements.len() as u32;
     let mut names = Vec::new();
@@ -89,7 +90,7 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
         }
     }
     let mut order: Vec<usize> = (0..elements.len()).collect();
-    order.sort_by_key(|&i| (elements[i].row.unwrap_or(u32::MAX), elements[i].col));
+    order.sort_by_key(|&i| elements[i].row.unwrap_or(u32::MAX));
     for i in order {
         let (e, offset) = (&elements[i], offsets[i]);
         let used = e.usage << e.col;
@@ -140,9 +141,12 @@ pub(crate) struct Psv<'a> {
     /// Compute: thread-group size and required wave size.
     pub threads: [u32; 3],
     pub wave_size: Option<u32>,
+    /// Emit `PSVRuntimeInfo3` (52 bytes, with `EntryFunctionName`) for
+    /// validator 1.8 (required for SM 6.6 compute-shader derivatives).
+    pub valver_1_8: bool,
 }
 
-/// `PSV0` with runtime info version 2 (validator 1.6).
+/// `PSV0` with runtime info version 2 (validator 1.6) or 3 (validator 1.8).
 pub(crate) fn psv(p: &Psv) -> Vec<u8> {
     let vectors = |els: &[SigElement]| {
         els.iter()
@@ -158,7 +162,7 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
             out.extend(v.to_le_bytes());
         }
     };
-    u32s(&mut out, &[48]);
+    u32s(&mut out, &[if p.valver_1_8 { 52 } else { 48 }]);
     let mut info = [0u8; 48];
     info[0] = u8::from(p.flag);
     let (min, max) = p.wave_size.map_or((0, u32::MAX), |n| (n, n));
@@ -181,6 +185,14 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
         info[30] = p.prims.len() as u8;
     }
     out.extend(info);
+    // Names of arbitrary semantics (system values use ""), then indices.
+    let mut strings = vec![0u8];
+    if p.valver_1_8 {
+        // EntryFunctionName offset into the PSV string table ("main\0").
+        let entry_name = strings.len() as u32;
+        strings.extend_from_slice(b"main\0");
+        u32s(&mut out, &[entry_name]);
+    }
     u32s(&mut out, &[p.bindings.len() as u32]);
     if !p.bindings.is_empty() {
         u32s(&mut out, &[24]);
@@ -191,8 +203,6 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
             );
         }
     }
-    // Names of arbitrary semantics (system values use ""), then indices.
-    let mut strings = vec![0u8];
     let mut indices: Vec<u32> = Vec::new();
     let mut elements = Vec::new();
     for e in p.inputs.iter().chain(p.outputs).chain(p.prims) {
