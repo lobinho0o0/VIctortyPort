@@ -682,6 +682,7 @@ version = "0.1.0"
 dependencies = [
  "memchr",
  "miniz_oxide",
+ "victory-shader",
 ]
 
 [[package]]
@@ -754,6 +755,7 @@ dependencies = [
 name = "victory-shader"
 version = "0.1.0"
 dependencies = [
+ "memchr",
  "miniz_oxide",
  "thiserror",
  "windows",
