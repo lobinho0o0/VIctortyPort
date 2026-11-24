@@ -763,6 +763,13 @@ pub(crate) struct HostTexture {
     pub(crate) state: std::sync::atomic::AtomicU32,
 }
 
+#[cfg(windows)]
+impl Drop for HostTexture {
+    fn drop(&mut self) {
+        crate::host::retire(self.texture.clone());
+    }
+}
+
 /// Moves the host texture to `wanted` (a host texture state); the host
 /// resource and the state it leaves, if that is a change.
 #[cfg(windows)]
