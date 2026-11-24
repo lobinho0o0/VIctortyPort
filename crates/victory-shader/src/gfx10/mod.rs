@@ -290,7 +290,7 @@ fn instruction(code: &[u8], offset: usize) -> Result<Instruction, ShaderError> {
     })
 }
 
-fn name(encoding: Encoding, opcode: u16) -> Option<&'static str> {
+pub(crate) fn name(encoding: Encoding, opcode: u16) -> Option<&'static str> {
     use opcodes as t;
     let (table, op) = match encoding {
         Encoding::Sop2 => (t::SOP2, opcode),

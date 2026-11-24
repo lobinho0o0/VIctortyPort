@@ -39,6 +39,7 @@ struct Global {
     /// Its pointer type.
     ptr: Ty,
     space: u32,
+    align: u64,
     /// An internal constant with this initialiser (a constant table).
     init: Option<u32>,
 }
@@ -73,7 +74,6 @@ pub(crate) enum Bin {
 pub(crate) enum Rmw {
     Xchg = 0,
     Add = 1,
-    Sub = 2,
     And = 3,
     Or = 5,
     Xor = 6,
@@ -323,9 +323,15 @@ impl Module {
             ty,
             ptr,
             space,
+            align: 3,
             init: None,
         });
         V::Global(self.globals.len() as u32 - 1)
+    }
+
+    pub fn align_global_to_eight(&mut self, global: V) {
+        let V::Global(n) = global else { unreachable!() };
+        self.globals[n as usize].align = 4; // log2(alignment) + 1
     }
 
     /// An internal constant global initialised with the constant `init`.
@@ -552,7 +558,7 @@ impl Module {
                     u64::from(g.space) << 2 | 2 | constant,
                     init,
                     linkage,
-                    3,
+                    g.align,
                     0,
                 ],
             );

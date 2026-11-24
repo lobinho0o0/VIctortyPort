@@ -19,8 +19,10 @@ pub(crate) mod flags {
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const INT64: u64 = 1 << 20;
+    pub const ATOMIC_INT64_GROUP_SHARED: u64 = 1 << 28;
     pub const RESOURCE_HEAP: u64 = 1 << 30;
     pub const SAMPLER_HEAP: u64 = 1 << 31;
+    pub const ATOMIC_INT64_HEAP: u64 = 1 << 32;
 }
 
 pub(crate) struct Types {
@@ -127,14 +129,21 @@ impl Shader {
         }
     }
 
-    /// The thread-group shared memory: `[lds_dwords x i32]` in address
-    /// space 3.
-    pub fn lds(&mut self) -> V {
+    /// The single LDS allocation in address space 3.
+    pub fn lds(&mut self, wide: bool) -> V {
         if let Some(g) = self.lds {
             return g;
         }
-        let arr = self.m.array(self.lds_dwords, self.t.i32);
+        let arr = if wide {
+            let i64t = self.m.int(64);
+            self.m.array(self.lds_dwords.div_ceil(2), i64t)
+        } else {
+            self.m.array(self.lds_dwords, self.t.i32)
+        };
         let g = self.m.global("lds", arr, 3);
+        if wide {
+            self.m.align_global_to_eight(g);
+        }
         self.lds = Some(g);
         g
     }
@@ -563,6 +572,12 @@ impl Shader {
         }
         if self.flags & flags::SAMPLER_HEAP != 0 {
             features |= 0x400_0000;
+        }
+        if self.flags & flags::ATOMIC_INT64_GROUP_SHARED != 0 {
+            features |= 0x80_0000;
+        }
+        if self.flags & flags::ATOMIC_INT64_HEAP != 0 {
+            features |= 0x1000_0000;
         }
         let sfi0 = features.to_le_bytes();
         let isg1 = container::signature(&self.inputs, true);
