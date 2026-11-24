@@ -127,6 +127,47 @@ pub fn read_frame(data: &[u8], start: usize) -> Option<Frame> {
     })
 }
 
+/// Reads a frame that begins near the end of one rolling input buffer and
+/// finishes at the start of the next. The continuation lives in the first
+/// `first_frame_bit` bits after the next packet's header; `next_in_tail` is
+/// where the frame after it begins in `tail`.
+pub fn read_frame_spanning(
+    head: &[u8],
+    head_bits: usize,
+    tail: &[u8],
+    start: usize,
+) -> Option<(Frame, usize)> {
+    let mut cursor = Cursor { data: head, pos: start };
+    let bits = cursor.bits(LENGTH_BITS)? as usize;
+    if bits <= LENGTH_BITS as usize || bits == 0x7fff {
+        return None;
+    }
+    let continuation = packet(tail, 0)?.first_frame_bit as usize;
+    if continuation == 0 || continuation >= bits || start >= head_bits || head_bits - start >= bits {
+        return None;
+    }
+    let mut out = vec![0u8; bits.div_ceil(8)];
+    for i in 0..bits {
+        let (data, at) = if start + i < head_bits {
+            (head, start + i)
+        } else {
+            (tail, 32 + i - (head_bits - start))
+        };
+        let byte = *data.get(at / 8)?;
+        out[i / 8] |= ((byte >> (7 - at % 8)) & 1) << (7 - i % 8);
+    }
+    let next_in_tail = 32 + continuation;
+    Some((
+        Frame {
+            data: out,
+            bits,
+            start,
+            next: Some(next_in_tail),
+        },
+        next_in_tail,
+    ))
+}
+
 /// Where the frame after the one at `start`..`end` begins: right after it,
 /// unless it was the last frame to begin in its packet and the rest of that
 /// packet is padding.
@@ -1045,6 +1086,47 @@ mod tests {
         let frame = read_frame(&data, start).expect("the frame at `start` is well formed");
         assert_eq!(frame.bits, 200);
         assert_eq!(frame.next, None);
+    }
+
+    /// A frame whose last eleven bits sit in the next rolling input buffer
+    /// comes back byte-for-byte the same as an unsplit frame.
+    #[test]
+    fn a_frame_can_finish_in_the_next_rolling_buffer() {
+        const BITS: usize = 31;
+        let whole = {
+            let mut d = vec![0u8; PACKET_BYTES];
+            put_bits(&mut d, 0, 32, 1 << 26);
+            put_bits(&mut d, 32, LENGTH_BITS, BITS as u32);
+            put_bits(&mut d, 47, 2, 0b10);
+            put_bits(&mut d, 49, 16, 0xABCD);
+            d
+        };
+        let unsplit = read_frame(&whole, 32).expect("whole frame");
+        assert_eq!(unsplit.bits, BITS);
+
+        let split_at = 52; // 20 bits in the head, 11 in the tail.
+        let mut head = vec![0u8; PACKET_BYTES];
+        for bit in 0..split_at {
+            if whole[bit / 8] >> (7 - bit % 8) & 1 == 1 {
+                head[bit / 8] |= 1 << (7 - bit % 8);
+            }
+        }
+        put_bits(&mut head, 0, 32, 1 << 26);
+        let mut tail = vec![0u8; PACKET_BYTES];
+        put_bits(&mut tail, 0, 32, (1 << 26) | (11 << 11));
+        for bit in split_at..32 + BITS {
+            let value = whole[bit / 8] >> (7 - bit % 8) & 1;
+            let at = 32 + bit - split_at;
+            if value == 1 {
+                tail[at / 8] |= 1 << (7 - at % 8);
+            }
+        }
+
+        let (spanning, next) =
+            read_frame_spanning(&head, split_at, &tail, 32).expect("spanning frame");
+        assert_eq!(spanning.bits, BITS);
+        assert_eq!(spanning.data, unsplit.data);
+        assert_eq!(next, 43);
     }
 
     /// The direct sum `imdct_half` stands for (FFmpeg's naive inverse MDCT:
