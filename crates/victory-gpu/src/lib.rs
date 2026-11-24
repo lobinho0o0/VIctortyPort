@@ -53,6 +53,6 @@ mod texture;
 mod watch;
 
 #[cfg(windows)]
-pub use host::on_failure;
+pub use host::{HdrDisplayInfo, display_hdr_info, on_failure};
 #[cfg(windows)]
 pub use watch::{title_memory_remapped, writing as kernel_will_write};
