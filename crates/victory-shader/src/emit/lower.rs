@@ -52,6 +52,13 @@ pub(crate) struct Parts<'a> {
     pub mesh_stride: u32,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The opcode audit: the instruction (by code offset) whose refusal is
+    /// reported even when none of its results are used.
+    pub(crate) static AUDIT_OFFSET: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
 enum Stop {
     /// A phi whose incoming value has no DXIL form was read: redo with it missing.
     Retry(Value, Why),
@@ -1218,6 +1225,33 @@ impl<'a> Lower<'a> {
         self.s.m.cast(self.cur, Cast::Bitcast, f, self.s.t.i32)
     }
 
+    fn sign_extend(&mut self, x: V, bits: u32) -> V {
+        let n = self.s.m.i32(32 - bits);
+        let x = self.s.m.bin(self.cur, Bin::Shl, x, n);
+        self.s.m.bin(self.cur, Bin::AShr, x, n)
+    }
+
+    fn pack_halves(&mut self, lo: V, hi: V) -> V {
+        let mask = self.s.m.i32(0xFFFF);
+        let k16 = self.s.m.i32(16);
+        let lo = self.s.m.bin(self.cur, Bin::And, lo, mask);
+        let hi = self.s.m.bin(self.cur, Bin::Shl, hi, k16);
+        self.s.m.bin(self.cur, Bin::Or, lo, hi)
+    }
+
+    fn int_pick(&mut self, p: u8, a: V, b: V) -> V {
+        let choose = self.s.m.cmp(self.cur, p, a, b);
+        self.s.m.select(self.cur, choose, a, b)
+    }
+
+    fn clamp_int(&mut self, x: V, bits: u32, min: i64, max: i64, signed: bool) -> V {
+        let t = self.s.m.int(bits);
+        let (min, max) = (self.s.m.int_const(t, min), self.s.m.int_const(t, max));
+        let (ge, le) = if signed { (pred::SGE, pred::SLE) } else { (pred::IUGE, pred::IULE) };
+        let x = self.int_pick(ge, x, min);
+        self.int_pick(le, x, max)
+    }
+
     /// The SDWA operand selection of source `k`: a byte or word of the
     /// dword, zero- or sign-extended (none: the whole dword).
     fn sdwa_src(inst: &Inst, k: usize) -> Option<(u8, bool)> {
@@ -1373,29 +1407,35 @@ impl<'a> Lower<'a> {
     /// field that runs past bit 31 extends from bit 31, as the hardware
     /// does: the shift is arithmetic then.
     fn bfe(&mut self, a: V, off: V, width: V, signed: bool) -> V {
+        self.bitfield(a, off, width, signed, 32)
+    }
+
+    fn bitfield(&mut self, a: V, off: V, width: V, signed: bool, bits: u32) -> V {
         let c = self.cur;
-        let (k31, k32, zero, one, ones) = (
-            self.s.m.i32(31),
-            self.s.m.i32(32),
-            self.s.m.i32(0),
-            self.s.m.i32(1),
-            self.s.m.i32(u32::MAX),
-        );
-        let off = self.s.m.bin(c, Bin::And, off, k31);
+        let ty = self.s.m.int(bits);
+        let last = self.s.m.i32(bits - 1);
+        let size = self.s.m.i32(bits);
+        let zero = self.s.m.i32(0);
+        let one = self.s.m.int_const(ty, 1);
+        let ones = self.s.m.int_const(ty, -1);
+        let off = self.s.m.bin(c, Bin::And, off, last);
+        let off = if bits == 64 { self.s.m.cast(c, Cast::ZExt, off, ty) } else { off };
         let shift = if signed { Bin::AShr } else { Bin::LShr };
         let shifted = self.s.m.bin(c, shift, a, off);
-        let full = self.s.m.cmp(c, pred::IUGE, width, k32);
-        let w = self.s.m.bin(c, Bin::And, width, k31);
-        let mask = self.s.m.bin(c, Bin::Shl, one, w);
+        let full = self.s.m.cmp(c, pred::IUGE, width, size);
+        let w = self.s.m.bin(c, Bin::And, width, last);
+        let count = if bits == 64 { self.s.m.cast(c, Cast::ZExt, w, ty) } else { w };
+        let mask = self.s.m.bin(c, Bin::Shl, one, count);
         let mask = self.s.m.bin(c, Bin::Sub, mask, one);
         let mask = self.s.m.select(c, full, ones, mask);
         let r = self.s.m.bin(c, Bin::And, shifted, mask);
         if !signed {
             return r;
         }
-        // Sign-extend a field narrower than 32 bits (none for width 0).
-        let left = self.s.m.bin(c, Bin::Sub, k32, w);
-        let left = self.s.m.bin(c, Bin::And, left, k31);
+        // Sign-extend a field narrower than the register (none for width 0).
+        let left = self.s.m.bin(c, Bin::Sub, size, w);
+        let left = self.s.m.bin(c, Bin::And, left, last);
+        let left = if bits == 64 { self.s.m.cast(c, Cast::ZExt, left, ty) } else { left };
         let t = self.s.m.bin(c, Bin::Shl, r, left);
         let t = self.s.m.bin(c, Bin::AShr, t, left);
         let is0 = self.s.m.cmp(c, pred::EQ, w, zero);
@@ -2239,6 +2279,12 @@ impl<'a> Lower<'a> {
             Fields::Flat { .. } if name.starts_with("global_") => self.flat(inst, b, i),
             Fields::Flat { .. } => Err("flat memory"),
         };
+        #[cfg(test)]
+        if let Err(why) = r
+            && AUDIT_OFFSET.get() == Some(offset)
+        {
+            return Err(unsupported(offset, why));
+        }
         match r {
             Ok(()) => Ok(()),
             Err(why) if effect => Err(unsupported(offset, why)),
@@ -2301,9 +2347,45 @@ impl<'a> Lower<'a> {
                     let x = crate::resource::inline(*k).ok_or("a special operand")?;
                     Ok(l.s.m.i32(if (x as i32) < 0 { u32::MAX } else { 0 }))
                 }
+                Some(Operand::Literal(x)) if name == "s_bfe_i64" => {
+                    // AMDGPUOperandSyntax: a literal in a signed i64 operand sign-extends.
+                    Ok(l.s.m.i32(if (*x as i32) < 0 { u32::MAX } else { 0 }))
+                }
                 _ => Ok(l.s.m.i32(0)),
             }
         };
+        // See AMD's RDNA 2 ISA, sections 12.1–12.4 (SOP2/K/1/C).
+        let old = |l: &mut Self, h: u8| -> Result<V, Why> {
+            let reg = dst_code.ok_or("a missing destination")?;
+            if reg == NULL {
+                return Ok(l.s.m.i32(0));
+            }
+            let value = inst.read(Reg::S(reg + h)).ok_or("an unread destination")?;
+            l.i32_of(value)
+        };
+        if name.starts_with("s_bitcmp") {
+            let index = src32(self, 1)?;
+            let a = half(self, 0, 0)?;
+            let x = if name.ends_with("64") {
+                let b = half(self, 0, 1)?;
+                let k32 = self.s.m.i32(32);
+                let hi = self.s.m.bin(c, Bin::And, index, k32);
+                let zero = self.s.m.i32(0);
+                let lo = self.s.m.cmp(c, pred::EQ, hi, zero);
+                self.s.m.select(c, lo, a, b)
+            } else {
+                a
+            };
+            let last = self.s.m.i32(31);
+            let index = self.s.m.bin(c, Bin::And, index, last);
+            let bit = self.s.m.bin(c, Bin::LShr, x, index);
+            let one = self.s.m.i32(1);
+            let bit = self.s.m.bin(c, Bin::And, bit, one);
+            let k = self.s.m.i32(u32::from(name.starts_with("s_bitcmp1")));
+            let test = self.s.m.cmp(c, pred::EQ, bit, k);
+            self.set(scc, Val::Bit(test));
+            return Ok(());
+        }
         if let Some(op) = name.strip_prefix("s_cmp_").filter(|o| o.ends_with("_u64")) {
             // eq and lg only: both dwords.
             let mut r = None;
@@ -2355,7 +2437,8 @@ impl<'a> Lower<'a> {
             self.set(scc, Val::Bit(r));
             return Ok(());
         }
-        let wide = name.ends_with("_b64") || name.ends_with("_u64") || name.ends_with("_i64");
+        let wide = name.ends_with("_b64") || name.ends_with("_u64") || name.ends_with("_i64")
+            || name == "s_bitreplicate_b64_b32";
         if wide {
             let hi = dst_code.and_then(|c| inst.write(Reg::S(c + 1)));
             let nonzero = |l: &mut Self, a: V, b: V| {
@@ -2364,7 +2447,7 @@ impl<'a> Lower<'a> {
                 l.s.m.cmp(c, pred::NE, o, z)
             };
             return match name {
-                "s_bcnt1_i32_b64" => {
+                "s_bcnt0_i32_b64" | "s_bcnt1_i32_b64" => {
                     let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
                     let i32t = self.s.t.i32;
                     let na = self
@@ -2374,29 +2457,125 @@ impl<'a> Lower<'a> {
                         .s
                         .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 31, &[b]);
                     let r = self.s.m.bin(c, Bin::Add, na, nb);
+                    let r = if name == "s_bcnt0_i32_b64" {
+                        let size = self.s.m.i32(64);
+                        self.s.m.bin(c, Bin::Sub, size, r)
+                    } else {
+                        r
+                    };
                     self.set(lo, Val::I32(r));
                     let z = self.s.m.i32(0);
                     let s = self.s.m.cmp(c, pred::NE, r, z);
                     self.set(scc, Val::Bit(s));
                     Ok(())
                 }
-                "s_ff1_i32_b64" => {
-                    // The lowest set bit; -1 for none (as DXIL's first bit low).
-                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
-                    let i32t = self.s.t.i32;
-                    let fa = self
-                        .s
-                        .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[a]);
-                    let fb = self
-                        .s
-                        .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[b]);
+                "s_ff0_i32_b64" | "s_ff1_i32_b64" | "s_flbit_i32_b64" | "s_flbit_i32_i64" => {
+                    let (mut a, mut b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    if name == "s_ff0_i32_b64" {
+                        let ones = self.s.m.i32(u32::MAX);
+                        a = self.s.m.bin(c, Bin::Xor, a, ones);
+                        b = self.s.m.bin(c, Bin::Xor, b, ones);
+                    } else if name == "s_flbit_i32_i64" {
+                        let k31 = self.s.m.i32(31);
+                        let sign = self.s.m.bin(c, Bin::AShr, b, k31);
+                        a = self.s.m.bin(c, Bin::Xor, a, sign);
+                        b = self.s.m.bin(c, Bin::Xor, b, sign);
+                    }
+                    let op = if name.starts_with("s_flbit") {
+                        (a, b) = (b, a);
+                        33 // first bit high, counted from the MSB
+                    } else {
+                        32 // first bit low
+                    };
+                    let first = self.s.op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, op, &[a]);
+                    let second = self.s.op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, op, &[b]);
                     let (z, k32) = (self.s.m.i32(0), self.s.m.i32(32));
-                    let fb32 = self.s.m.bin(c, Bin::Add, fb, k32);
+                    let offset = self.s.m.bin(c, Bin::Add, second, k32);
                     let none = self.s.m.cmp(c, pred::EQ, b, z);
-                    let fb = self.s.m.select(c, none, fb, fb32);
-                    let low = self.s.m.cmp(c, pred::NE, a, z);
-                    let r = self.s.m.select(c, low, fa, fb);
+                    let second = self.s.m.select(c, none, second, offset);
+                    let found = self.s.m.cmp(c, pred::NE, a, z);
+                    let r = self.s.m.select(c, found, first, second);
                     self.set(lo, Val::I32(r));
+                    Ok(())
+                }
+                "s_brev_b64" => {
+                    for (h, dst) in [(0, hi), (1, lo)] {
+                        let x = half(self, 0, h)?;
+                        let x = self.s.op(c, "unary.i32", Attr::ReadNone, self.s.t.i32, 30, &[x]);
+                        self.set(dst, Val::I32(x));
+                    }
+                    Ok(())
+                }
+                "s_bitreplicate_b64_b32" => {
+                    let x = src32(self, 0)?;
+                    let k16 = self.s.m.i32(16);
+                    let upper = self.s.m.bin(c, Bin::LShr, x, k16);
+                    for (mut x, dst) in [(x, lo), (upper, hi)] {
+                        let mask = self.s.m.i32(0xFFFF);
+                        x = self.s.m.bin(c, Bin::And, x, mask);
+                        // Spread the 16 source bits onto even positions.
+                        for (shift, mask) in [(8, 0x00FF_00FF), (4, 0x0F0F_0F0F),
+                                              (2, 0x3333_3333), (1, 0x5555_5555)] {
+                            let sh = self.s.m.i32(shift);
+                            let m = self.s.m.i32(mask);
+                            let t = self.s.m.bin(c, Bin::Shl, x, sh);
+                            let t = self.s.m.bin(c, Bin::Or, t, x);
+                            x = self.s.m.bin(c, Bin::And, t, m);
+                        }
+                        let one = self.s.m.i32(1);
+                        let other = self.s.m.bin(c, Bin::Shl, x, one);
+                        let r = self.s.m.bin(c, Bin::Or, x, other);
+                        self.set(dst, Val::I32(r));
+                    }
+                    Ok(())
+                }
+                "s_bfe_u64" | "s_bfe_i64" | "s_bfm_b64" | "s_bitset0_b64" | "s_bitset1_b64" => {
+                    let ty = self.s.m.int(64);
+                    self.s.flags |= flags::INT64;
+                    let one = self.s.m.int_const(ty, 1);
+                    let k63 = self.s.m.i32(63);
+                    let count = |l: &mut Self, x: V| {
+                        let x = l.s.m.bin(c, Bin::And, x, k63);
+                        l.s.m.cast(c, Cast::ZExt, x, ty)
+                    };
+                    let r = match name {
+                        "s_bfe_u64" | "s_bfe_i64" => {
+                            let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                            let a = self.join64(a, b);
+                            let off = src32(self, 1)?;
+                            let k16 = self.s.m.i32(16);
+                            let k127 = self.s.m.i32(127);
+                            let w = self.s.m.bin(c, Bin::LShr, off, k16);
+                            let w = self.s.m.bin(c, Bin::And, w, k127);
+                            self.bitfield(a, off, w, name == "s_bfe_i64", 64)
+                        }
+                        "s_bfm_b64" => {
+                            let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                            let (width, off) = (count(self, a), count(self, b));
+                            let m = self.s.m.bin(c, Bin::Shl, one, width);
+                            let m = self.s.m.bin(c, Bin::Sub, m, one);
+                            self.s.m.bin(c, Bin::Shl, m, off)
+                        }
+                        _ => {
+                            let (a, b) = (old(self, 0)?, old(self, 1)?);
+                            let x = self.join64(a, b);
+                            let bit = src32(self, 0)?;
+                            let bit = count(self, bit);
+                            let bit = self.s.m.bin(c, Bin::Shl, one, bit);
+                            if name == "s_bitset0_b64" {
+                                let ones = self.s.m.int_const(ty, -1);
+                                let mask = self.s.m.bin(c, Bin::Xor, bit, ones);
+                                self.s.m.bin(c, Bin::And, x, mask)
+                            } else {
+                                self.s.m.bin(c, Bin::Or, x, bit)
+                            }
+                        }
+                    };
+                    let (a, b) = self.split64(r);
+                    self.set(lo, Val::I32(a));
+                    self.set(hi, Val::I32(b));
+                    let nz = nonzero(self, a, b);
+                    self.set(scc, Val::Bit(nz));
                     Ok(())
                 }
                 "s_and_b64" | "s_or_b64" | "s_xor_b64" | "s_andn2_b64" | "s_orn2_b64"
@@ -2550,10 +2729,14 @@ impl<'a> Lower<'a> {
                     .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, op, &[a]);
                 (r, None)
             }
-            "s_ff1_i32_b32" | "s_bcnt1_i32_b32" => {
+            "s_ff0_i32_b32" | "s_ff1_i32_b32" | "s_bcnt0_i32_b32" | "s_bcnt1_i32_b32" => {
                 // First set bit (-1 for zero, as DXIL's), or the bit count.
-                let a = src32(self, 0)?;
-                let op = if name == "s_ff1_i32_b32" { 32 } else { 31 };
+                let mut a = src32(self, 0)?;
+                if matches!(name, "s_ff0_i32_b32" | "s_bcnt0_i32_b32") {
+                    let ones = self.s.m.i32(u32::MAX);
+                    a = self.s.m.bin(c, Bin::Xor, a, ones);
+                }
+                let op = if name.starts_with("s_ff") { 32 } else { 31 };
                 let r = self
                     .s
                     .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, op, &[a]);
@@ -2613,12 +2796,31 @@ impl<'a> Lower<'a> {
                 let t = self.s.m.cmp(c, p, a, b);
                 (self.s.m.select(c, t, a, b), None)
             }
-            "s_abs_i32" => {
-                let a = src32(self, 0)?;
+            "s_abs_i32" | "s_absdiff_i32" => {
+                let mut a = src32(self, 0)?;
+                if name == "s_absdiff_i32" {
+                    let b = src32(self, 1)?;
+                    a = self.s.m.bin(c, Bin::Sub, a, b);
+                }
                 let z = self.s.m.i32(0);
                 let neg = self.s.m.cmp(c, pred::SLT, a, z);
                 let n = self.s.m.bin(c, Bin::Sub, z, a);
                 (self.s.m.select(c, neg, n, a), None)
+            }
+            "s_sext_i32_i8" | "s_sext_i32_i16" => {
+                let a = src32(self, 0)?;
+                (self.sign_extend(a, if name.ends_with("i8") { 8 } else { 16 }), None)
+            }
+            "s_pack_ll_b32_b16" | "s_pack_lh_b32_b16" | "s_pack_hh_b32_b16" => {
+                let (mut a, mut b) = (src32(self, 0)?, src32(self, 1)?);
+                let k16 = self.s.m.i32(16);
+                if name == "s_pack_hh_b32_b16" {
+                    a = self.s.m.bin(c, Bin::LShr, a, k16);
+                }
+                if name != "s_pack_ll_b32_b16" {
+                    b = self.s.m.bin(c, Bin::LShr, b, k16);
+                }
+                (self.pack_halves(a, b), None)
             }
             "s_bitset0_b32" | "s_bitset1_b32" => {
                 // Sets (clears) bit src[4:0] of the destination it reads.
@@ -3502,10 +3704,125 @@ impl<'a> Lower<'a> {
         if let Some(r) = self.valu16(inst, name, guard) {
             return r;
         }
+        if name == "v_pk_fmac_f16" {
+            return Err("packed half FMA requires a single rounding to f16");
+        }
         if let Some(op) = name.strip_prefix("v_pk_") {
             return self.packed16(inst, op, guard);
         }
         match name {
+            "v_frexp_exp_i16_f16" | "v_frexp_exp_i32_f32" | "v_frexp_exp_i32_f64"
+            | "v_frexp_mant_f16" | "v_frexp_mant_f32" | "v_frexp_mant_f64" => {
+                self.frexp(inst, guard)
+            }
+            "v_ldexp_f16" | "v_ldexp_f32" | "v_ldexp_f64" => {
+                Err("ldexp requires the console floating-point rounding and denormal mode")
+            }
+            "v_mullit_f32" => Err("lighting multiply needs the console NaN, infinity and overflow rules"),
+            "v_dot2_f32_f16" | "v_dot2c_f32_f16" => Err("half dot product rounding is unspecified by the emitter"),
+            "v_fmamk_f16" | "v_fmaak_f16" => Err("half FMA requires a single rounding to f16"),
+            n if n.starts_with("v_cvt_norm_") || n.starts_with("v_cvt_pknorm_") => {
+                Err("normalized conversion needs the console rounding and NaN rules")
+            }
+            "v_mad_i32_i16" | "v_mad_u32_u16" => {
+                let signed = !name.ends_with("u16");
+                if v.omod != 0 || v.abs != 0 || v.neg != 0 || v.opsel & !3 != 0 {
+                    return Err("modifiers on integer arithmetic");
+                }
+                let read = |l: &mut Self, i| -> Result<V, Why> {
+                    let x = l.half_src(inst, i)?;
+                    Ok(if signed { l.sign_extend(x, 16) } else { x })
+                };
+                let (a, b) = (read(self, 0)?, read(self, 1)?);
+                let d = s(self, 2)?;
+                let arithmetic = |l: &mut Self, a, b, d| {
+                    let m = l.s.m.bin(c, Bin::Mul, a, b);
+                    l.s.m.bin(c, Bin::Add, m, d)
+                };
+                let r = if v.clamp {
+                    let (a, b) = (self.extend64(a, signed), self.extend64(b, signed));
+                    let d = self.extend64(d, signed);
+                    let r = arithmetic(self, a, b, d);
+                    let (min, max) = if signed { (i32::MIN as i64, i32::MAX as i64) } else { (0, u32::MAX as i64) };
+                    let r = self.clamp_int(r, 64, min, max, signed);
+                    self.s.m.cast(c, Cast::Trunc, r, self.s.t.i32)
+                } else {
+                    arithmetic(self, a, b, d)
+                };
+                let Some(Operand::Vector { reg, .. }) = v.dst else { return Err("a result without a VGPR") };
+                self.write(inst, Reg::V(reg), r, guard);
+                Ok(())
+            }
+            "v_cvt_pk_u16_u32" | "v_cvt_pk_i16_i32" | "v_sat_pk_u8_i16" => {
+                // LLVM's AMDGPU clamp combines use the saturating V_CVT_PK
+                // conversions. V_SAT_PK clamps each signed half to a byte.
+                let a = s(self, 0)?;
+                let r = if name == "v_sat_pk_u8_i16" {
+                    let (k16, k8) = (self.s.m.i32(16), self.s.m.i32(8));
+                    let hi = self.s.m.bin(c, Bin::AShr, a, k16);
+                    let lo = self.sign_extend(a, 16);
+                    let lo = self.clamp_int(lo, 32, 0, 255, true);
+                    let hi = self.clamp_int(hi, 32, 0, 255, true);
+                    let hi = self.s.m.bin(c, Bin::Shl, hi, k8);
+                    self.s.m.bin(c, Bin::Or, lo, hi)
+                } else {
+                    let b = s(self, 1)?;
+                    let signed = name == "v_cvt_pk_i16_i32";
+                    let (min, max) = if signed { (-32768, 32767) } else { (0, 65535) };
+                    let (a, b) = (self.clamp_int(a, 32, min, max, signed), self.clamp_int(b, 32, min, max, signed));
+                    self.pack_halves(a, b)
+                };
+                int(self, r)
+            }
+            "v_cvt_off_f32_i4" => {
+                // RDNA 2 ISA, VOP1: a signed nibble in sixteenths of a pixel.
+                let x = s(self, 0)?;
+                let x = self.sign_extend(x, 4);
+                let x = self.s.m.cast(c, Cast::SiToFp, x, self.s.t.f32);
+                let step = self.s.m.f32(0.0625f32.to_bits());
+                let x = self.s.m.bin(c, Bin::Mul, x, step);
+                float(self, x)
+            }
+            "v_dot2_i32_i16" | "v_dot2_u32_u16" | "v_dot4_i32_i8" | "v_dot4c_i32_i8"
+            | "v_dot4_u32_u8" | "v_dot8_u32_u4" => self.integer_dot(inst, guard),
+            "v_mad_u64_u32" | "v_mad_i64_i32" => self.wide_mad(inst, guard),
+            "v_qsad_pk_u16_u8" | "v_mqsad_pk_u16_u8" | "v_mqsad_u32_u8" => {
+                if v.clamp || v.omod != 0 || v.abs != 0 || v.neg != 0 || v.opsel != 0 {
+                    return Err("modifiers on a quad SAD");
+                }
+                let a = self.src64(inst, 0)?;
+                let b = s(self, 1)?;
+                let Some(Operand::Vector { reg, .. }) = v.dst else { return Err("a quad SAD result") };
+                let acc = if name == "v_mqsad_u32_u8" {
+                    self.vgprs(inst, &v.src[2], 4)?
+                } else {
+                    let acc = self.src64(inst, 2)?;
+                    let (lo, hi) = self.split64(acc);
+                    vec![lo, hi]
+                };
+                let mut packed_lo = None;
+                for i in 0..4u8 {
+                    let ty = self.s.m.int(64);
+                    let sh = self.s.m.int_const(ty, i64::from(i) * 8);
+                    let window = self.s.m.bin(c, Bin::LShr, a, sh);
+                    let window = self.s.m.cast(c, Cast::Trunc, window, self.s.t.i32);
+                    let diff = self.sad(window, b, 8, name != "v_qsad_pk_u16_u8");
+                    if acc.len() == 4 {
+                        let r = self.s.m.bin(c, Bin::Add, diff, acc[usize::from(i)]);
+                        self.write(inst, Reg::V(reg + i), r, guard);
+                    } else {
+                        let d = self.int_field(acc[usize::from(i / 2)], u32::from(i % 2) * 16, 16);
+                        let r = self.s.m.bin(c, Bin::Add, diff, d);
+                        if let Some(lo) = packed_lo.take() {
+                            let r = self.pack_halves(lo, r);
+                            self.write(inst, Reg::V(reg + i / 2), r, guard);
+                        } else {
+                            packed_lo = Some(r);
+                        }
+                    }
+                }
+                Ok(())
+            }
             "v_lshlrev_b64" | "v_lshrrev_b64" | "v_ashrrev_i64" => {
                 let n = s(self, 0)?;
                 let x = self.src64(inst, 1)?;
@@ -4005,6 +4322,7 @@ impl<'a> Lower<'a> {
                 );
                 int(self, r)
             }
+            n if n.contains("_f64") => Err("floating-point arithmetic in f64 is not implemented by the DXIL emitter"),
             _ => {
                 let r = self.integer(inst, name)?;
                 int(self, r)
@@ -4020,6 +4338,14 @@ impl<'a> Lower<'a> {
         if v.abs >> k & 1 != 0 || v.neg >> k & 1 != 0 || v.sdwa.is_some() || v.dpp.is_some() {
             return Err("64-bit operand modifiers");
         }
+        self.raw_src64(inst, k, false)
+    }
+
+    fn raw_src64(&mut self, inst: &Inst, k: usize, float: bool) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else { unreachable!() };
+        if v.sdwa.is_some() || v.dpp.is_some() {
+            return Err("64-bit SDWA or DPP operands");
+        }
         let c = self.cur;
         let i64t = self.s.m.int(64);
         self.s.flags |= flags::INT64;
@@ -4027,16 +4353,25 @@ impl<'a> Lower<'a> {
         let pair = |l: &mut Self, r: Reg, r1: Reg| -> Result<V, Why> {
             let lo = l.i32_of(inst.read(r).ok_or("an unread operand")?)?;
             let hi = l.i32_of(inst.read(r1).ok_or("an unread operand")?)?;
-            let lo = l.s.m.cast(c, Cast::ZExt, lo, i64t);
-            let hi = l.s.m.cast(c, Cast::ZExt, hi, i64t);
-            let k32 = l.s.m.int_const(i64t, 32);
-            let hi = l.s.m.bin(c, Bin::Shl, hi, k32);
-            Ok(l.s.m.bin(c, Bin::Or, lo, hi))
+            Ok(l.join64(lo, hi))
         };
         match op {
             Operand::Vector { reg, .. } => pair(self, Reg::V(reg), Reg::V(reg + 1)),
             Operand::Scalar { code, .. } if code != NULL => {
                 pair(self, Reg::S(code), Reg::S(code + 1))
+            }
+            Operand::Const(k @ 240..=248) if float => {
+                let f = if k == 248 {
+                    0.5 * std::f64::consts::FRAC_1_PI
+                } else {
+                    let b = crate::resource::inline(k).ok_or("a special operand")?;
+                    f64::from(f32::from_bits(b))
+                };
+                Ok(self.s.m.int_const(i64t, f.to_bits() as i64))
+            }
+            Operand::Literal(x) if float => Ok(self.s.m.int_const(i64t, i64::from(x) << 32)),
+            Operand::Literal(x) if inst.name() == "v_mad_i64_i32" => {
+                Ok(self.s.m.int_const(i64t, i64::from(x as i32)))
             }
             Operand::Const(k @ 128..=208) => {
                 let x = crate::resource::inline(k).ok_or("a special operand")?;
@@ -4048,6 +4383,135 @@ impl<'a> Lower<'a> {
                 Ok(self.s.m.cast(c, Cast::ZExt, x, i64t))
             }
         }
+    }
+
+    /// IEEE source bits, with sign modifiers applied as bit operations so
+    /// that a signalling NaN, a denormal or a negative zero is preserved.
+    fn fp_bits(&mut self, inst: &Inst, k: usize, bits: u32) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else { unreachable!() };
+        let mut x = match bits {
+            16 => self.half_src(inst, k)?,
+            32 => match (self.src0, k) {
+                (Some(x), 0) => x,
+                _ => {
+                    let op = v.src.get(k).ok_or("a missing operand")?;
+                    let x = self.operand(inst, op)?;
+                    match Self::sdwa_src(inst, k) {
+                        Some((sel, sext)) => self.select_bits(x, sel, sext),
+                        None => x,
+                    }
+                }
+            },
+            _ => self.raw_src64(inst, k, true)?,
+        };
+        let ty = self.s.m.int(bits.max(32));
+        let sign = 1u64 << (bits - 1);
+        if v.abs >> k & 1 != 0 {
+            let mask = self.s.m.int_const(ty, (sign - 1) as i64);
+            x = self.s.m.bin(self.cur, Bin::And, x, mask);
+        }
+        if v.neg >> k & 1 != 0 {
+            let sign = self.s.m.int_const(ty, sign as i64);
+            x = self.s.m.bin(self.cur, Bin::Xor, x, sign);
+        }
+        Ok(x)
+    }
+
+    /// Decompose the IEEE encoding directly. AMD's RDNA 2 ISA specifies
+    /// zero exponent for infinities and NaNs and passes their mantissa
+    /// through. LLVM's AMDGPU frexp fold also normalizes subnormal inputs.
+    fn frexp(&mut self, inst: &Inst, guard: Option<V>) -> Result<(), Why> {
+        let Fields::Valu(v) = &inst.fields else { unreachable!() };
+        if v.clamp || v.omod != 0 {
+            return Err("floating output modifiers on frexp");
+        }
+        let name = inst.name();
+        let (bits, fraction, bias) = if name.ends_with("f64") { (64, 52, 1023) }
+            else if name.ends_with("f32") { (32, 23, 127) } else { (16, 10, 15) };
+        let c = self.cur;
+        let ty = self.s.m.int(bits.max(32));
+        let x = self.fp_bits(inst, 0, bits)?;
+        let k = |l: &mut Self, n| l.s.m.int_const(ty, n);
+        let (z, frac, shift, emax, abs) = (k(self, 0), k(self, (1 << fraction) - 1),
+            k(self, fraction), k(self, 2 * bias + 1), k(self, ((1u64 << (bits - 1)) - 1) as i64));
+        let mant = self.s.m.bin(c, Bin::And, x, frac);
+        let exp = self.s.m.bin(c, Bin::LShr, x, shift);
+        let exp = self.s.m.bin(c, Bin::And, exp, emax);
+        let subnormal = self.s.m.cmp(c, pred::EQ, exp, z);
+        let abs = self.s.m.bin(c, Bin::And, x, abs);
+        let nonzero = self.s.m.cmp(c, pred::NE, abs, z);
+        let finite = self.s.m.cmp(c, pred::NE, exp, emax);
+        let compute = self.s.m.bin(c, Bin::And, nonzero, finite);
+        // Locate the highest set fraction bit with DXIL's i32 first-bit-high.
+        let fb = |l: &mut Self, a| l.s.op(c, "unaryBits.i32", Attr::ReadNone, l.s.t.i32, 33, &[a]);
+        let leading = if bits == 64 {
+            let (lo, hi) = self.split64(mant);
+            let (a, b) = (fb(self, lo), fb(self, hi));
+            let (size, zero) = (self.s.m.i32(32), self.s.m.i32(0));
+            let a = self.s.m.bin(c, Bin::Add, a, size);
+            let low = self.s.m.cmp(c, pred::EQ, hi, zero);
+            self.s.m.select(c, low, a, b)
+        } else {
+            fb(self, mant)
+        };
+        // A zero mantissa can produce -1. Mask the normalization shift
+        // before emitting even the unselected path, so it is always defined.
+        let offset = self.s.m.i32(bits.max(32) - 1 - fraction as u32);
+        let left = self.s.m.bin(c, Bin::Sub, leading, offset);
+        let limit = self.s.m.i32(bits.max(32) - 1);
+        let left = self.s.m.bin(c, Bin::And, left, limit);
+        let left = if bits == 64 { self.extend64(left, false) } else { left };
+        let Some(Operand::Vector { reg, .. }) = v.dst else { return Err("a frexp result") };
+        if name.starts_with("v_frexp_exp_") {
+            let one = k(self, 1);
+            let e_sub = self.s.m.bin(c, Bin::Sub, one, left);
+            let e = self.s.m.select(c, subnormal, e_sub, exp);
+            let bias = k(self, bias - 1);
+            let e = self.s.m.bin(c, Bin::Sub, e, bias);
+            let e = self.s.m.select(c, compute, e, z);
+            if bits == 16 {
+                self.write_half(inst, e, guard)
+            } else {
+                let e = if bits == 64 { self.s.m.cast(c, Cast::Trunc, e, self.s.t.i32) } else { e };
+                self.write_i(inst, e, guard)
+            }
+        } else {
+            let norm = self.s.m.bin(c, Bin::Shl, mant, left);
+            let mant = self.s.m.select(c, subnormal, norm, mant);
+            let mant = self.s.m.bin(c, Bin::And, mant, frac);
+            let sign = k(self, (1u64 << (bits - 1)) as i64);
+            let sign = self.s.m.bin(c, Bin::And, x, sign);
+            let half = k(self, (bias - 1) << fraction);
+            let value = self.s.m.bin(c, Bin::Or, sign, half);
+            let value = self.s.m.bin(c, Bin::Or, value, mant);
+            let value = self.s.m.select(c, compute, value, x);
+            match bits {
+                16 => self.write_half(inst, value, guard),
+                32 => self.write_i(inst, value, guard),
+                _ => {
+                    let (lo, hi) = self.split64(value);
+                    self.write(inst, Reg::V(reg), lo, guard);
+                    self.write(inst, Reg::V(reg + 1), hi, guard);
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    fn join64(&mut self, lo: V, hi: V) -> V {
+        let c = self.cur;
+        let ty = self.s.m.int(64);
+        let lo = self.s.m.cast(c, Cast::ZExt, lo, ty);
+        let hi = self.s.m.cast(c, Cast::ZExt, hi, ty);
+        let k32 = self.s.m.int_const(ty, 32);
+        let hi = self.s.m.bin(c, Bin::Shl, hi, k32);
+        self.s.m.bin(c, Bin::Or, lo, hi)
+    }
+
+    fn extend64(&mut self, x: V, signed: bool) -> V {
+        self.s.flags |= flags::INT64;
+        let ty = self.s.m.int(64);
+        self.s.m.cast(self.cur, if signed { Cast::SExt } else { Cast::ZExt }, x, ty)
     }
 
     /// The low and high dwords of an i64.
@@ -4201,6 +4665,14 @@ impl<'a> Lower<'a> {
         ];
         const INT: &[&str] = &[
             "v_add_nc_u16",
+            "v_mad_i16",
+            "v_mad_u16",
+            "v_min3_i16",
+            "v_min3_u16",
+            "v_max3_i16",
+            "v_max3_u16",
+            "v_med3_i16",
+            "v_med3_u16",
             "v_sub_nc_u16",
             "v_subrev_nc_u16",
             "v_mul_lo_u16",
@@ -4352,7 +4824,8 @@ impl<'a> Lower<'a> {
             return float_result(self, r);
         }
         // 16-bit integers: computed on the low halves, the low 16 bits kept.
-        if v.clamp || v.omod != 0 || v.abs != 0 || v.neg != 0 {
+        let saturates = matches!(name, "v_mad_i16" | "v_mad_u16");
+        if v.clamp && !saturates || v.omod != 0 || v.abs != 0 || v.neg != 0 {
             return Err("modifiers on a 16-bit integer operation");
         }
         let r = match name {
@@ -4368,36 +4841,37 @@ impl<'a> Lower<'a> {
                 self.s.m.cast(c, op, a, i32t)
             }
             _ => {
-                let (mut a, mut b) = (self.half_src(inst, 0)?, self.half_src(inst, 1)?);
-                let k16 = self.s.m.i32(16);
-                let sext = |l: &mut Self, x: V| {
-                    let t = l.s.m.bin(c, Bin::Shl, x, k16);
-                    l.s.m.bin(c, Bin::AShr, t, k16)
+                let signed = name.ends_with("_i16");
+                let read = |l: &mut Self, i| -> Result<V, Why> {
+                    let x = l.half_src(inst, i)?;
+                    Ok(if signed { l.sign_extend(x, 16) } else { x })
                 };
-                if name.ends_with("_i16") {
-                    a = sext(self, a);
-                    b = sext(self, b);
-                }
+                let (a, b) = (read(self, 0)?, read(self, 1)?);
                 let k15 = self.s.m.i32(15);
                 match name {
                     "v_add_nc_u16" => self.s.m.bin(c, Bin::Add, a, b),
                     "v_sub_nc_u16" => self.s.m.bin(c, Bin::Sub, a, b),
                     "v_subrev_nc_u16" => self.s.m.bin(c, Bin::Sub, b, a),
                     "v_mul_lo_u16" => self.s.m.bin(c, Bin::Mul, a, b),
+                    "v_mad_i16" | "v_mad_u16" => {
+                        let d = read(self, 2)?;
+                        let m = self.s.m.bin(c, Bin::Mul, a, b);
+                        self.s.m.bin(c, Bin::Add, m, d)
+                    }
+                    "v_min3_i16" | "v_min3_u16" | "v_max3_i16" | "v_max3_u16"
+                    | "v_med3_i16" | "v_med3_u16" => {
+                        let d = read(self, 2)?;
+                        self.int3(&name[2..6], signed, a, b, d)
+                    }
                     "v_lshlrev_b16" | "v_lshrrev_b16" | "v_ashrrev_i16" => {
                         // src0 is the shift (4 bits), src1 the value.
                         let sh = self.s.m.bin(c, Bin::And, a, k15);
-                        let x = if name == "v_ashrrev_i16" {
-                            sext(self, b)
-                        } else {
-                            b
-                        };
                         let op = match name {
                             "v_lshlrev_b16" => Bin::Shl,
                             "v_lshrrev_b16" => Bin::LShr,
                             _ => Bin::AShr,
                         };
-                        self.s.m.bin(c, op, x, sh)
+                        self.s.m.bin(c, op, b, sh)
                     }
                     _ => {
                         let p = match name {
@@ -4411,6 +4885,13 @@ impl<'a> Lower<'a> {
                     }
                 }
             }
+        };
+        let r = if v.clamp {
+            let signed = name.ends_with("_i16");
+            let (lo, hi) = if signed { (-32768, 32767) } else { (0, 65535) };
+            self.clamp_int(r, 32, lo, hi, signed)
+        } else {
+            r
         };
         self.write_half(inst, r, guard)
     }
@@ -4556,6 +5037,143 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// The sign or carry bit above the 64-bit multiply-add is returned in
+    /// SDST. LLVM's AMDGPURegisterBankInfo describes the signed form as the
+    /// low bit of sign(product) + sign(accumulator) + unsigned carry-out.
+    fn wide_mad(&mut self, inst: &Inst, guard: Option<V>) -> Result<(), Why> {
+        let Fields::Valu(v) = &inst.fields else { unreachable!() };
+        if v.clamp {
+            return Err("clamped 64-bit multiply-add carry semantics");
+        }
+        let Some(Operand::Vector { reg, .. }) = v.dst else { return Err("a wide multiply-add result") };
+        let signed = inst.name() == "v_mad_i64_i32";
+        let (a, b) = (self.src(inst, 0)?, self.src(inst, 1)?);
+        let (a, b) = (self.extend64(a, signed), self.extend64(b, signed));
+        let acc = self.src64(inst, 2)?;
+        let c = self.cur;
+        let prod = self.s.m.bin(c, Bin::Mul, a, b);
+        let sum = self.s.m.bin(c, Bin::Add, prod, acc);
+        let mut carry = self.s.m.cmp(c, pred::IULT, sum, prod);
+        if signed {
+            let t = self.s.m.int(64);
+            let z = self.s.m.int_const(t, 0);
+            let pneg = self.s.m.cmp(c, pred::SLT, prod, z);
+            let aneg = self.s.m.cmp(c, pred::SLT, acc, z);
+            let signs = self.s.m.bin(c, Bin::Xor, pneg, aneg);
+            carry = self.s.m.bin(c, Bin::Xor, carry, signs);
+        }
+        if let Some(Operand::Scalar { code, .. }) = v.carry
+            && let Some(w) = inst.write(Reg::S(code))
+        {
+            self.lane_bits.insert(w, carry);
+        }
+        let (lo, hi) = self.split64(sum);
+        self.write(inst, Reg::V(reg), lo, guard);
+        self.write(inst, Reg::V(reg + 1), hi, guard);
+        Ok(())
+    }
+
+    fn int_field(&mut self, x: V, shift: u32, width: u32) -> V {
+        if width == 32 {
+            return x;
+        }
+        let sh = self.s.m.i32(shift);
+        let mask = self.s.m.i32((1 << width) - 1);
+        let x = self.s.m.bin(self.cur, Bin::LShr, x, sh);
+        self.s.m.bin(self.cur, Bin::And, x, mask)
+    }
+
+    fn int3(&mut self, op: &str, signed: bool, a: V, b: V, d: V) -> V {
+        let (lt, gt) = if signed { (pred::SLT, pred::SGT) } else { (pred::IULT, pred::IUGT) };
+        match op {
+            "min3" => {
+                let t = self.int_pick(lt, a, b);
+                self.int_pick(lt, t, d)
+            }
+            "max3" => {
+                let t = self.int_pick(gt, a, b);
+                self.int_pick(gt, t, d)
+            }
+            _ => {
+                let lo = self.int_pick(lt, a, b);
+                let hi = self.int_pick(gt, a, b);
+                let t = self.int_pick(lt, hi, d);
+                self.int_pick(gt, lo, t)
+            }
+        }
+    }
+
+    /// Integer dot products, including the optional output saturation in
+    /// VOP3P (LLVM AMDGPUUsage's sdot/udot intrinsics).
+    fn integer_dot(&mut self, inst: &Inst, guard: Option<V>) -> Result<(), Why> {
+        let Fields::Valu(v) = &inst.fields else { unreachable!() };
+        let name = inst.name();
+        let implicit = name == "v_dot4c_i32_i8";
+        let width = if name.starts_with("v_dot2") { 16 } else if name.starts_with("v_dot4") { 8 } else { 4 };
+        let signed = name.contains("_i32");
+        if v.neg != 0 || v.neg_hi != 0 || v.abs != 0 || v.omod != 0 || v.sdwa.is_some() {
+            return Err("modifiers on an integer dot product");
+        }
+        let Some(Operand::Vector { reg, .. }) = v.dst else { return Err("an integer dot product result") };
+        let c = self.cur;
+        let a = self.src(inst, 0)?;
+        let b = self.src(inst, 1)?;
+        let d = if implicit {
+            self.i32_of(inst.read(Reg::V(reg)).ok_or("a dot product accumulator")?)?
+        } else {
+            self.src(inst, 2)?
+        };
+        let mut sum = if v.clamp { self.extend64(d, signed) } else { d };
+        for i in 0..32 / width {
+            // dot2 has independent low/high half selects for each input.
+            let (sa, sb) = if width == 16 {
+                let sel = if i == 0 { v.opsel } else { v.opsel_hi };
+                (u32::from(sel & 1) * 16, u32::from(sel >> 1 & 1) * 16)
+            } else {
+                (i * width, i * width)
+            };
+            let (mut a, mut b) = (self.int_field(a, sa, width), self.int_field(b, sb, width));
+            if signed {
+                a = self.sign_extend(a, width);
+                b = self.sign_extend(b, width);
+            }
+            if v.clamp {
+                a = self.extend64(a, signed);
+                b = self.extend64(b, signed);
+            }
+            let p = self.s.m.bin(c, Bin::Mul, a, b);
+            sum = self.s.m.bin(c, Bin::Add, sum, p);
+        }
+        if v.clamp {
+            let (min, max) = if signed { (i32::MIN as i64, i32::MAX as i64) } else { (0, u32::MAX as i64) };
+            sum = self.clamp_int(sum, 64, min, max, signed);
+            sum = self.s.m.cast(c, Cast::Trunc, sum, self.s.t.i32);
+        }
+        self.write(inst, Reg::V(reg), sum, guard);
+        Ok(())
+    }
+
+    /// Sum of the unsigned absolute differences of the packed elements.
+    fn sad(&mut self, a: V, b: V, width: u32, masked: bool) -> V {
+        let c = self.cur;
+        let zero = self.s.m.i32(0);
+        let mut sum = zero;
+        for offset in (0..32).step_by(width as usize) {
+            let x = self.int_field(a, offset, width);
+            let y = self.int_field(b, offset, width);
+            let ge = self.s.m.cmp(c, pred::IUGE, x, y);
+            let xy = self.s.m.bin(c, Bin::Sub, x, y);
+            let yx = self.s.m.bin(c, Bin::Sub, y, x);
+            let mut diff = self.s.m.select(c, ge, xy, yx);
+            if masked {
+                let skip = self.s.m.cmp(c, pred::EQ, y, zero);
+                diff = self.s.m.select(c, skip, zero, diff);
+            }
+            sum = self.s.m.bin(c, Bin::Add, sum, diff);
+        }
+        sum
+    }
+
     fn integer(&mut self, inst: &Inst, name: &'static str) -> Result<V, Why> {
         let c = self.cur;
         let s = |l: &mut Self, k| l.src(inst, k);
@@ -4632,11 +5250,11 @@ impl<'a> Lower<'a> {
                     }
                 }
             }
-            "v_mul_u32_u24" | "v_mul_i32_i24" => {
+            "v_mul_u32_u24" | "v_mul_i32_i24" | "v_mul_hi_i32_i24" | "v_mul_hi_u32_u24" => {
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
                 let (sh, op) = (
                     k(self, 8),
-                    if name == "v_mul_i32_i24" {
+                    if name.ends_with("i24") {
                         Bin::AShr
                     } else {
                         Bin::LShr
@@ -4646,7 +5264,42 @@ impl<'a> Lower<'a> {
                 let a = self.s.m.bin(c, op, a, sh);
                 let b = self.s.m.bin(c, Bin::Shl, b, sh);
                 let b = self.s.m.bin(c, op, b, sh);
-                self.s.m.bin(c, Bin::Mul, a, b)
+                if name.starts_with("v_mul_hi") {
+                    self.mul_hi(a, b, name.ends_with("i24"))
+                } else {
+                    self.s.m.bin(c, Bin::Mul, a, b)
+                }
+            }
+            "v_sad_u8" | "v_sad_hi_u8" | "v_sad_u16" | "v_sad_u32" | "v_msad_u8" => {
+                // RDNA 2 ISA, VOP3A: accumulation wraps in the dword.
+                let (a, b, d) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                let width = if name.ends_with("u8") { 8 } else if name.ends_with("u16") { 16 } else { 32 };
+                let sum = self.sad(a, b, width, name == "v_msad_u8");
+                let sum = if name == "v_sad_hi_u8" {
+                    let k16 = k(self, 16);
+                    self.s.m.bin(c, Bin::Shl, sum, k16)
+                } else {
+                    sum
+                };
+                self.s.m.bin(c, Bin::Add, sum, d)
+            }
+            "v_lerp_u8" => {
+                // RDNA 2 ISA, VOP3A: low bit of each byte of S2 rounds a tie up.
+                let (a, b, d) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                let one = k(self, 1);
+                let mut result = k(self, 0);
+                for shift in [0, 8, 16, 24] {
+                    let x = self.int_field(a, shift, 8);
+                    let y = self.int_field(b, shift, 8);
+                    let round = self.int_field(d, shift, 1);
+                    let sum = self.s.m.bin(c, Bin::Add, x, y);
+                    let sum = self.s.m.bin(c, Bin::Add, sum, round);
+                    let avg = self.s.m.bin(c, Bin::LShr, sum, one);
+                    let sh = k(self, shift);
+                    let field = self.s.m.bin(c, Bin::Shl, avg, sh);
+                    result = self.s.m.bin(c, Bin::Or, result, field);
+                }
+                result
             }
             "v_bfe_u32" | "v_bfe_i32" => {
                 let (a, off, w) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
@@ -4729,32 +5382,7 @@ impl<'a> Lower<'a> {
             "v_min3_i32" | "v_max3_i32" | "v_min3_u32" | "v_max3_u32" | "v_med3_i32"
             | "v_med3_u32" => {
                 let (a, b, d) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
-                let signed = name.ends_with("i32");
-                let (lt, gt) = if signed {
-                    (pred::SLT, pred::SGT)
-                } else {
-                    (pred::IULT, pred::IUGT)
-                };
-                let pick = |l: &mut Self, p, x, y| {
-                    let t = l.s.m.cmp(c, p, x, y);
-                    l.s.m.select(c, t, x, y)
-                };
-                match &name[2..6] {
-                    "min3" => {
-                        let t = pick(self, lt, a, b);
-                        pick(self, lt, t, d)
-                    }
-                    "max3" => {
-                        let t = pick(self, gt, a, b);
-                        pick(self, gt, t, d)
-                    }
-                    _ => {
-                        let lo = pick(self, lt, a, b);
-                        let hi = pick(self, gt, a, b);
-                        let t = pick(self, lt, hi, d);
-                        pick(self, gt, lo, t)
-                    }
-                }
+                self.int3(&name[2..6], name.ends_with("i32"), a, b, d)
             }
             "v_perm_b32" => {
                 // Byte i of the result is byte S of {src0, src1} (src1 the
@@ -4933,56 +5561,103 @@ impl<'a> Lower<'a> {
         })
     }
 
+    /// AMD RDNA 2 ISA, VOPC: classify the input bits without converting to a
+    /// host float. Conversion can quiet an sNaN or flush a denormal.
+    fn fp_class(&mut self, inst: &Inst, format: &str) -> Result<V, Why> {
+        let (bits, fraction, exp_mask) = match format {
+            "f16" => (16, 10, 0x1F),
+            "f32" => (32, 23, 0xFF),
+            _ => (64, 52, 0x7FF),
+        };
+        let c = self.cur;
+        let ty = self.s.m.int(bits.max(32));
+        let x = self.fp_bits(inst, 0, bits)?;
+        let mask = if bits == 16 { self.half_src(inst, 1)? } else { self.src(inst, 1)? };
+        let (zero, sh, emax, frac, sign, quiet) = (
+            self.s.m.int_const(ty, 0), self.s.m.int_const(ty, fraction),
+            self.s.m.int_const(ty, exp_mask), self.s.m.int_const(ty, (1 << fraction) - 1),
+            self.s.m.int_const(ty, (1u64 << (bits - 1)) as i64),
+            self.s.m.int_const(ty, 1 << (fraction - 1)),
+        );
+        let e = self.s.m.bin(c, Bin::LShr, x, sh);
+        let e = self.s.m.bin(c, Bin::And, e, emax);
+        let m = self.s.m.bin(c, Bin::And, x, frac);
+        let neg = self.s.m.bin(c, Bin::And, x, sign);
+        let q = self.s.m.bin(c, Bin::And, x, quiet);
+        let subnormal = self.s.m.cmp(c, pred::EQ, e, zero);
+        let nonfinite = self.s.m.cmp(c, pred::EQ, e, emax);
+        let no_frac = self.s.m.cmp(c, pred::EQ, m, zero);
+        let has_frac = self.s.m.cmp(c, pred::NE, m, zero);
+        let neg = self.s.m.cmp(c, pred::NE, neg, zero);
+        let quiet = self.s.m.cmp(c, pred::NE, q, zero);
+        // Positive classes 6-9, negative classes 11 minus those.
+        let zero = self.s.m.i32(0);
+        let (one, six, seven, eight, nine, eleven) = (self.s.m.i32(1), self.s.m.i32(6),
+            self.s.m.i32(7), self.s.m.i32(8), self.s.m.i32(9), self.s.m.i32(11));
+        let denorm_or_zero = self.s.m.select(c, no_frac, six, seven);
+        let class = self.s.m.select(c, subnormal, denorm_or_zero, eight);
+        let class = self.s.m.select(c, nonfinite, nine, class);
+        let mirrored = self.s.m.bin(c, Bin::Sub, eleven, class);
+        let class = self.s.m.select(c, neg, mirrored, class);
+        let nan = self.s.m.bin(c, Bin::And, nonfinite, has_frac);
+        let nan_class = self.s.m.select(c, quiet, one, zero);
+        let class = self.s.m.select(c, nan, nan_class, class);
+        let bit = self.s.m.bin(c, Bin::LShr, mask, class);
+        let bit = self.s.m.bin(c, Bin::And, bit, one);
+        Ok(self.s.m.cmp(c, pred::NE, bit, zero))
+    }
+
+    /// Compare double encodings in IEEE order using integer operations.
+    /// Flipping the sign for nonnegative values and complementing negative
+    /// ones makes their unsigned order match their numeric order.
+    fn compare_f64(&mut self, inst: &Inst, op: &str) -> Result<V, Why> {
+        if matches!(op, "f" | "tru") {
+            return Ok(self.s.m.bool(op == "tru"));
+        }
+        let c = self.cur;
+        let (a, b) = (self.fp_bits(inst, 0, 64)?, self.fp_bits(inst, 1, 64)?);
+        let ty = self.s.m.int(64);
+        let (z, sign, abs, inf, ones) = (self.s.m.int_const(ty, 0), self.s.m.int_const(ty, i64::MIN),
+            self.s.m.int_const(ty, i64::MAX), self.s.m.int_const(ty, 0x7FF0_0000_0000_0000),
+            self.s.m.int_const(ty, -1));
+        let abs_a = self.s.m.bin(c, Bin::And, a, abs);
+        let abs_b = self.s.m.bin(c, Bin::And, b, abs);
+        let nan_a = self.s.m.cmp(c, pred::IUGT, abs_a, inf);
+        let nan_b = self.s.m.cmp(c, pred::IUGT, abs_b, inf);
+        let unordered = self.s.m.bin(c, Bin::Or, nan_a, nan_b);
+        let yes = self.s.m.bool(true);
+        let ordered = self.s.m.bin(c, Bin::Xor, unordered, yes);
+        if op == "u" || op == "o" {
+            return Ok(if op == "u" { unordered } else { ordered });
+        }
+        let key = |l: &mut Self, x, magnitude| {
+            let zero = l.s.m.cmp(c, pred::EQ, magnitude, z);
+            let x = l.s.m.select(c, zero, z, x); // both zeros compare equal
+            let neg = l.s.m.cmp(c, pred::SLT, x, z);
+            let xor = l.s.m.select(c, neg, ones, sign);
+            l.s.m.bin(c, Bin::Xor, x, xor)
+        };
+        let (a, b) = (key(self, a, abs_a), key(self, b, abs_b));
+        let (p, negated) = match op {
+            "lt" | "nlt" => (pred::IULT, op == "nlt"),
+            "eq" | "neq" => (pred::EQ, op == "neq"),
+            "le" | "nle" => (pred::IULE, op == "nle"),
+            "gt" | "ngt" => (pred::IUGT, op == "ngt"),
+            "lg" | "nlg" => (pred::NE, op == "nlg"),
+            "ge" | "nge" => (pred::IUGE, op == "nge"),
+            _ => return Err("a double compare predicate"),
+        };
+        let test = self.s.m.cmp(c, p, a, b);
+        let test = self.s.m.bin(c, Bin::And, ordered, test);
+        Ok(if negated { self.s.m.bin(c, Bin::Xor, test, yes) } else { test })
+    }
+
     fn compare(&mut self, inst: &Inst, rest: &str) -> Result<(), Why> {
         let (op, ty) = rest.rsplit_once('_').ok_or("a compare")?;
         let c = self.cur;
         let r = match ty {
-            "f32" if op == "class" => {
-                // Bit k of src1 tests class k: signalling NaN, quiet NaN,
-                // -inf, -normal, -denormal, -0, +0, +denormal, +normal, +inf.
-                let x = self.fsrc(inst, 0)?;
-                let x = self.as_int(x);
-                let mask = self.src(inst, 1)?;
-                let k = |l: &mut Self, v: u32| l.s.m.i32(v);
-                let (k23, k31, kff, mant, quiet) = (
-                    k(self, 23),
-                    k(self, 31),
-                    k(self, 0xFF),
-                    k(self, 0x7F_FFFF),
-                    k(self, 0x40_0000),
-                );
-                let e = self.s.m.bin(c, Bin::LShr, x, k23);
-                let e = self.s.m.bin(c, Bin::And, e, kff);
-                let m = self.s.m.bin(c, Bin::And, x, mant);
-                let neg = self.s.m.bin(c, Bin::LShr, x, k31);
-                let zero = k(self, 0);
-                let (e0, e255) = (
-                    self.s.m.cmp(c, pred::EQ, e, zero),
-                    self.s.m.cmp(c, pred::EQ, e, kff),
-                );
-                let m0 = self.s.m.cmp(c, pred::EQ, m, zero);
-                let q = self.s.m.bin(c, Bin::And, x, quiet);
-                let q = self.s.m.cmp(c, pred::NE, q, zero);
-                // Positive classes 6-9; negative ones are 11 minus those.
-                let (normal, inf, zero_c, denorm) =
-                    (k(self, 8), k(self, 9), k(self, 6), k(self, 7));
-                let t = self.s.m.select(c, m0, zero_c, denorm);
-                let t = self.s.m.select(c, e0, t, normal);
-                let t = self.s.m.select(c, e255, inf, t);
-                let eleven = k(self, 11);
-                let mirrored = self.s.m.bin(c, Bin::Sub, eleven, t);
-                let is_neg = self.s.m.cmp(c, pred::NE, neg, zero);
-                let t = self.s.m.select(c, is_neg, mirrored, t);
-                let (one, snan) = (k(self, 1), k(self, 0));
-                let nan_class = self.s.m.select(c, q, one, snan);
-                let yes = self.s.m.bool(true);
-                let nan = self.s.m.bin(c, Bin::Xor, m0, yes);
-                let nan = self.s.m.bin(c, Bin::And, nan, e255);
-                let t = self.s.m.select(c, nan, nan_class, t);
-                let bit = self.s.m.bin(c, Bin::LShr, mask, t);
-                let bit = self.s.m.bin(c, Bin::And, bit, one);
-                self.s.m.cmp(c, pred::NE, bit, zero)
-            }
+            "f16" | "f32" | "f64" if op == "class" => self.fp_class(inst, ty)?,
+            "f64" => self.compare_f64(inst, op)?,
             "f32" | "f16" => {
                 let (a, b) = if ty == "f16" {
                     (self.half_fsrc(inst, 0)?, self.half_fsrc(inst, 1)?)
@@ -5010,6 +5685,7 @@ impl<'a> Lower<'a> {
                 };
                 self.s.m.cmp(c, p, a, b)
             }
+            "u64" | "i64" if matches!(op, "f" | "t") => self.s.m.bool(op == "t"),
             "u64" | "i64" => {
                 let (a, b) = (self.src64(inst, 0)?, self.src64(inst, 1)?);
                 let signed = ty == "i64";
