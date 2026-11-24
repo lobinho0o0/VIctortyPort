@@ -98,7 +98,10 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
         // the loader maps the copy away from its preferred base (Wine always
         // does for DYNAMIC_BASE images), and the loader then reads callbacks
         // from there. Make that entry a no-op.
-        let field_rva = tls.directory_rva + layout::TLS64_ADDRESS_OF_CALLBACKS as u32;
+        let field_rva = tls
+            .directory_rva
+            .checked_add(layout::TLS64_ADDRESS_OF_CALLBACKS as u32)
+            .ok_or(PrepareError::Patch("TLS callback field RVA overflow"))?;
         for (entry, target) in dir64_relocations(&bytes, &info) {
             if target == field_rva {
                 write_u16(&mut bytes, entry, 0)?; // IMAGE_REL_BASED_ABSOLUTE
@@ -119,19 +122,29 @@ const IMPORT_DESCRIPTOR_SIZE: u32 = 20;
 /// Every `IMAGE_REL_BASED_DIR64` base relocation: (file offset of its entry,
 /// RVA it patches). Empty if the image has no readable relocation table.
 fn dir64_relocations(bytes: &[u8], info: &ImageInfo) -> Vec<(usize, u32)> {
-    const DIR64: u16 = 10;
-    let mut out = Vec::new();
     let Some(d) = layout::data_directory_offset(bytes, dir::BASERELOC) else {
-        return out;
+        return Vec::new();
     };
     let (Some(rva), Some(size)) = (layout::read_u32(bytes, d), layout::read_u32(bytes, d + 4))
     else {
-        return out;
+        return Vec::new();
     };
     let Some(start) = info.rva_to_file_offset(rva).filter(|_| size != 0) else {
-        return out;
+        return Vec::new();
     };
-    let (mut at, end) = (start as usize, start as usize + size as usize);
+    let start = start as usize;
+    dir64_entries(bytes, start, start.saturating_add(size as usize))
+}
+
+/// The `IMAGE_REL_BASED_DIR64` entries of the relocation blocks in
+/// `bytes[start..end]`. An entry whose target does not fit in an RVA (a
+/// damaged block near the top of the address space) patches nothing the
+/// image could hold, so it is left out rather than wrapped around to the
+/// RVA of some other field.
+fn dir64_entries(bytes: &[u8], start: usize, end: usize) -> Vec<(usize, u32)> {
+    const DIR64: u16 = 10;
+    let mut out = Vec::new();
+    let mut at = start;
     while at + 8 <= end {
         let (Some(page), Some(block)) =
             (layout::read_u32(bytes, at), layout::read_u32(bytes, at + 4))
@@ -147,8 +160,10 @@ fn dir64_relocations(bytes: &[u8], info: &ImageInfo) -> Vec<(usize, u32)> {
                 break;
             };
             let e = u16::from_le_bytes([e[0], e[1]]);
-            if e >> 12 == DIR64 {
-                out.push((entry, page + u32::from(e & 0xFFF)));
+            if e >> 12 == DIR64
+                && let Some(target) = page.checked_add(u32::from(e & 0xFFF))
+            {
+                out.push((entry, target));
             }
         }
         at += block;
@@ -271,6 +286,47 @@ mod tests {
             assigned, 0,
             "the process executable already owns TLS slot zero"
         );
+    }
+
+    /// One relocation block: page RVA, then its 16-bit entries.
+    fn block(page: u32, entries: &[u16]) -> Vec<u8> {
+        let mut b = page.to_le_bytes().to_vec();
+        b.extend_from_slice(&(8 + 2 * entries.len() as u32).to_le_bytes());
+        for e in entries {
+            b.extend_from_slice(&e.to_le_bytes());
+        }
+        b
+    }
+
+    #[test]
+    fn dir64_entries_walk_blocks_and_skip_other_types() {
+        // DIR64 at +0x10, an ABSOLUTE pad, then a HIGHLOW (type 3) entry.
+        let mut bytes = block(0x1000, &[0xA010, 0x0000, 0x3020, 0xA018]);
+        bytes.extend(block(0x2000, &[0xA000, 0x0000]));
+        assert_eq!(
+            dir64_entries(&bytes, 0, bytes.len()),
+            [(8, 0x1010), (14, 0x1018), (24, 0x2000)]
+        );
+        // A block that claims more than the directory holds ends the walk.
+        let mut bytes = block(0x1000, &[0xA010, 0x0000]);
+        bytes[4] = 0x40;
+        assert!(dir64_entries(&bytes, 0, bytes.len()).is_empty());
+    }
+
+    #[test]
+    fn dir64_entries_drop_targets_past_the_top_of_the_address_space() {
+        // A damaged page RVA near u32::MAX: page + offset does not fit, and
+        // wrapping it would name a low RVA (0x0 for 0xFFFF_FFF0 + 0x10) that
+        // belongs to some other field. Entries whose target fits are kept.
+        let bytes = block(0xFFFF_F000, &[0xA000, 0xAFFF, 0x0000]);
+        assert_eq!(
+            dir64_entries(&bytes, 0, bytes.len()),
+            [(8, 0xFFFF_F000), (10, 0xFFFF_FFFF)]
+        );
+        let bytes = block(0xFFFF_FFF0, &[0xA00F, 0xA010, 0xAFFF]);
+        assert_eq!(dir64_entries(&bytes, 0, bytes.len()), [(8, 0xFFFF_FFFF)]);
+        // An end past the buffer stops at the bytes there are.
+        assert_eq!(dir64_entries(&bytes, 0, usize::MAX).len(), 1);
     }
 
     #[test]
