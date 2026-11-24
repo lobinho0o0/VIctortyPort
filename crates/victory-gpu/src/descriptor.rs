@@ -678,6 +678,222 @@ mod tests {
         create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], out)
     }
 
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn translated_shader_reads_root_indexed_buffer_from_fresh_table() {
+        use crate::pipeline::{Translated, compute_for_test};
+        use victory_shader::native::{ComputeIo, StageIo};
+        use victory_shader::{
+            Container, HwStage, NativeProgram, ResourceType, RootParam, RootType, UsedResource,
+        };
+        use windows::Win32::Graphics::{Direct3D12::*, Dxgi::Common::DXGI_FORMAT_R32_TYPELESS};
+        use windows::core::Interface;
+
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [1, 1, 1],
+            }),
+            layout: [
+                (RootType::Constants, 0, 1),
+                (RootType::Table, 2, 0),
+                (RootType::Table, 4, 2),
+            ]
+            .into_iter()
+            .map(|(root, user_data, slot)| RootParam {
+                root,
+                user_data,
+                slot,
+                sgprs: 1,
+                table_offset_dwords: 0,
+                base_register: 0,
+            })
+            .collect(),
+            used: [
+                (ResourceType::Cbv, 2, 0, 0),
+                (ResourceType::Srv, 2, 0, 8),
+                (ResourceType::Uav, 4, 2, 0),
+            ]
+            .into_iter()
+            .map(
+                |(kind, user_data, slot, table_offset_dwords)| UsedResource {
+                    kind,
+                    user_data,
+                    slot,
+                    root: RootType::Table,
+                    table_offset_dwords,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 4,
+                },
+            )
+            .collect(),
+            code: [
+                0xBE83_0380u32, // s_mov_b32 s3, 0
+                0xBE85_0380,    // s_mov_b32 s5, 0
+                0x8F06_8500,    // s_lshl_b32 s6, s0, 5
+                0xF408_0201,
+                0x0C00_0020, // s_load_dwordx4 s[8:11], s[2:3], s6 offset:32
+                0xF408_0302,
+                0xFA00_0000, // s_load_dwordx4 s[12:15], s[4:5], 0
+                0xE030_0000,
+                0x8002_0000, // buffer_load_dword v0, off, s[8:11], 0
+                0xE070_0000,
+                0x8003_0000, // buffer_store_dword v0, off, s[12:15], 0
+                0xBF81_0000, // s_endpgm
+            ]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect(),
+        };
+        let program = victory_shader::ir::build(&native.code, false, native.vgprs).unwrap();
+        let resources =
+            victory_shader::resource::track(&program, &native.layout, native.stage).unwrap();
+        let flow = victory_shader::structure::structure(&program).unwrap();
+        let io = victory_shader::io::raise(&program, &native).unwrap();
+        let container = Container {
+            digest: [0; 16],
+            version: (1, 0),
+            parts: Vec::new(),
+        };
+        let shader =
+            victory_shader::emit::emit(&container, &native, &program, &flow, &io, &resources)
+                .unwrap();
+        assert_eq!(shader.root_indexed_views.len(), 1);
+        assert!(shader.root_srvs.is_empty());
+
+        let device = crate::host::host().expect("the readback fixture needs a D3D12 device");
+        if std::env::var_os("VICTORY_D3D12_DEBUG").is_some() {
+            device.device.cast::<ID3D12InfoQueue>().expect("D3D12 debug queue");
+        }
+        let mut samplers = std::ptr::null();
+        assert_eq!(
+            create(
+                HeapDesc {
+                    kind: SAMPLERS,
+                    count: 1,
+                    flags: 1,
+                    nodes: 0,
+                },
+                Placement {
+                    address: 0,
+                    size: 0,
+                },
+                &mut samplers,
+            ),
+            S_OK
+        );
+        let mut this = std::ptr::null();
+        let desc = HeapDesc {
+            kind: 0,
+            count: 6,
+            flags: 1,
+            nodes: 0,
+        };
+        assert_eq!(
+            create(
+                desc,
+                Placement {
+                    address: 0,
+                    size: 0
+                },
+                &mut this
+            ),
+            S_OK
+        );
+        let heap = heap(this);
+        let mut data = [[0u32; 64]; 4];
+        let sentinels = [0xa55a_1234, 0x10fe_cafe];
+        data[1][0] = sentinels[0];
+        data[2][0] = sentinels[1];
+        let bases = data.each_mut().map(|buffer| buffer.as_mut_ptr() as u64);
+        for address in bases {
+            crate::shadow::register(address as usize, address, 256);
+        }
+        create_cbv(
+            std::ptr::null(),
+            &[bases[0] as u32, (bases[0] >> 32) as u32, 256, 0],
+            heap.start + 32,
+        );
+        let mut resource = [0u32; 14];
+        resource[0] = D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32;
+        resource[4] = 256;
+        for (index, address) in [2, 3, 5].into_iter().zip(bases[1..].iter().copied()) {
+            let mut view = [0u32; 16];
+            view[0] = DXGI_FORMAT_R32_TYPELESS.0 as u32;
+            view[1] = D3D12_SRV_DIMENSION_BUFFER.0 as u32;
+            view[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            view[6] = 64;
+            view[8] = D3D12_BUFFER_SRV_FLAG_RAW.0 as u32;
+            let uav = index == 5;
+            if uav {
+                view[1] = D3D12_UAV_DIMENSION_BUFFER.0 as u32;
+                view[2] = 0;
+                view[4] = 64;
+                view[6] = 0;
+                view[8] = D3D12_BUFFER_UAV_FLAG_RAW.0 as u32;
+            }
+            view[10] = address as u32;
+            view[11] = (address >> 32) as u32;
+            record(heap.start + index * 32, View::Placed(uav, resource, view));
+        }
+        let host = heap.host().expect("host view heap");
+        {
+            let list = device.new_list().unwrap();
+            let mut state = crate::draw::State::default();
+            state.set_heaps(&[this]);
+            state.set_table(true, 0, heap.start + 32);
+            state.set_table(true, 2, heap.start + 160);
+            state.set_constants(true, 1, &[1], 0);
+            let static_only = state.tables(&list, &native.used, &[], true);
+            // A control with only the static resource list has no buffer at
+            // the later index. Inspect it without dispatching an invalid read.
+            assert!(!host.retains_resource(static_only[0].1 / 32 + 2));
+        }
+        let pipeline = compute_for_test(Translated {
+            host: shader,
+            used: native.used,
+        });
+        let translated = pipeline.stages[0].translated();
+        let mut readback = Vec::new();
+        for selector in 0..=1 {
+            let list = device.new_list().unwrap();
+            let mut state = crate::draw::State::default();
+            state.set_heaps(&[this, samplers]);
+            state.set_table(true, 0, heap.start + 32);
+            state.set_table(true, 2, heap.start + 160);
+            state.set_constants(true, 1, &[selector], 0);
+            // Exercise production binding on both a new table and a
+            // cache hit, and check that the selected slot holds a buffer.
+            if selector == 0 {
+                state.bind(&list, &pipeline, true);
+            }
+            let made =
+                state.tables(&list, &translated.used, &translated.host.root_indexed_views, true);
+            assert_eq!(made.len(), 1);
+            assert!(host.retains_resource(made[0].1 / 32 + 1 + selector));
+            if selector == 1 {
+                state.bind(&list, &pipeline, true);
+            }
+            // SAFETY: an open list with its compute state bound.
+            unsafe { list.list.Dispatch(1, 1, 1) };
+            list.close();
+            assert_eq!(device.log_messages(), None);
+            device.execute(&[&list]);
+            // SAFETY: execute has waited and copied the UAV back to this array.
+            readback.push(unsafe { (bases[3] as *const u32).read_volatile() });
+        }
+        release(this);
+        release(samplers);
+        for address in bases {
+            crate::shadow::unregister(address as usize, address);
+        }
+        assert_eq!(readback, sentinels);
+    }
+
     #[test]
     fn heaps_hold_count_descriptors_from_their_start() {
         let null = std::ptr::null();
