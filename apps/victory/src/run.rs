@@ -13,13 +13,17 @@ pub fn run(
     console: Console,
 ) -> Result<()> {
     use std::sync::Arc;
+    use victory_core::diagnostics::{self, IoOperation};
     use victory_hle::{HleResolver, HostPolicy};
     use victory_loader::{BindReport, UnimplementedPolicy, WithTitleDlls};
 
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
-    let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
+    let started = diagnostics::operation_started();
+    let original = std::fs::read(exe)
+        .inspect_err(|error| IoOperation::ReadImage.failed(error, started))
+        .with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
     match victory_game::identify(&hash) {

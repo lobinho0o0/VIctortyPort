@@ -96,6 +96,8 @@ victory config
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).
 
+For structured failure reports, see [Dependency diagnostics](docs/dependency-diagnostics.md).
+
 ## Debugging
 
 A release build has no debugging aids. Build them in with

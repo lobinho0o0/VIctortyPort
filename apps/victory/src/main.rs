@@ -21,6 +21,10 @@ use clap::{Parser, Subcommand, ValueEnum};
     about = "Run an Xbox Series title natively on Windows"
 )]
 struct Cli {
+    /// Write structured diagnostics to a new file outside every VIctory checkout.
+    #[arg(long, global = true, value_name = "FILE")]
+    diagnostic_jsonl: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -129,7 +133,20 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let cli = Cli::parse();
-    match cli.command {
+    if let Some(path) = cli.diagnostic_jsonl
+        && victory_core::diagnostics::start(&path).is_err()
+    {
+        eprintln!(
+            "VIctory: cannot create diagnostic output (expected a new file outside the source tree)"
+        );
+    }
+    let result = dispatch(cli.command);
+    victory_core::diagnostics::finish(result.is_ok());
+    result
+}
+
+fn dispatch(command: Command) -> Result<()> {
+    match command {
         Command::Inspect {
             file,
             imports,
