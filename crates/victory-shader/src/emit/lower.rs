@@ -3527,6 +3527,47 @@ impl<'a> Lower<'a> {
                 self.write(inst, Reg::V(reg + 1), hi, guard);
                 Ok(())
             }
+            "v_mad_u64_u32" | "v_mad_i64_i32" => {
+                if v.clamp {
+                    return Err("a clamped integer operation");
+                }
+                let signed = name == "v_mad_i64_i32";
+                let (a, bb, acc) = (s(self, 0)?, s(self, 1)?, self.src64(inst, 2)?);
+                let i64t = self.s.m.int(64);
+                let ext = if signed { Cast::SExt } else { Cast::ZExt };
+                let a = self.s.m.cast(c, ext, a, i64t);
+                let bb = self.s.m.cast(c, ext, bb, i64t);
+                let prod = self.s.m.bin(c, Bin::Mul, a, bb);
+                let sum = self.s.m.bin(c, Bin::Add, prod, acc);
+                let ucarry = self.s.m.cmp(c, pred::IULT, sum, prod);
+                let carry = if signed {
+                    let z64 = self.s.m.int_const(i64t, 0);
+                    let sp = self.s.m.cmp(c, pred::SLT, prod, z64);
+                    let sa = self.s.m.cmp(c, pred::SLT, acc, z64);
+                    let signs = self.s.m.bin(c, Bin::Xor, sp, sa);
+                    self.s.m.bin(c, Bin::Xor, ucarry, signs)
+                } else {
+                    ucarry
+                };
+                self.s.flags |= flags::INT64;
+                let Some(Operand::Vector { reg, .. }) = v.dst else {
+                    return Err("a 64-bit result");
+                };
+                let (lo, hi) = self.split64(sum);
+                self.write(inst, Reg::V(reg), lo, guard);
+                self.write(inst, Reg::V(reg + 1), hi, guard);
+                if let Some(Operand::Scalar { code, .. }) = v.carry
+                    && let Some(w) = inst.write(Reg::S(code))
+                {
+                    self.lane_bits.insert(w, carry);
+                }
+                for &(_, w) in &inst.writes {
+                    self.vals
+                        .entry(w)
+                        .or_insert(Val::Missing("a lane mask read as data"));
+                }
+                Ok(())
+            }
             "v_cubeid_f32" | "v_cubesc_f32" | "v_cubetc_f32" | "v_cubema_f32" => {
                 // Cube-map face coordinates (AMD's ISA): the major axis is z
                 // when |z| >= |x| and |z| >= |y|, else y when |y| >= |x|,
