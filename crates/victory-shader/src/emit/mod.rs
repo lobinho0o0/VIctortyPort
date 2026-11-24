@@ -944,10 +944,11 @@ mod tests {
     }
 
     #[test]
-    fn biased_16bit_image_sample_unpacks_f32_bias_and_f16_coords_and_validates() {
+    fn biased_16bit_image_sample_unpacks_f16_bias_and_f16_coords_and_validates() {
         // Synthetic PS executing `image_sample_b v0, v[1:2], s[4:11], s[12:15]
-        // dmask:0x1 dim:SQ_RSRC_IMG_2D a16` where v1 is a 32-bit f32 bias
-        // (-1.0) and v2 holds packed f16 (u, v) = (0.5, 0.5), then exporting v0.
+        // dmask:0x1 dim:SQ_RSRC_IMG_2D a16` where v1 holds an f16 bias (-1.0)
+        // in its low half (the high half is ignored, as the hardware does) and
+        // v2 holds packed f16 (u, v) = (0.5, 0.5), then exporting v0.
         let words = [
             0xBE81_0380u32, // s_mov_b32 s1, 0
             0xF40C_0100,    // s_load_dwordx8 s[4:11], s[0:1], 0
@@ -956,7 +957,8 @@ mod tests {
             0xBE8D_0380,    // s_mov_b32 s13, 0
             0xBE8E_0380,    // s_mov_b32 s14, 0
             0xBE8F_0380,    // s_mov_b32 s15, 0
-            0x7E02_02F3,    // v_mov_b32 v1, -1.0 (32-bit f32 bias)
+            0x7E02_02FF,    // v_mov_b32 v1, lit(0x5A5A_BC00)
+            0x5A5A_BC00,    // f16 -1.0 bias in the low half
             0x7E04_02FF,    // v_mov_b32 v2, lit(0x3800_3800) (packed f16 0.5, 0.5)
             0x3800_3800,
             // MIMG image_sample_b (op=0x25): dmask=0x1, dim=1 (2D), a16=1 (bit 30 of w1)

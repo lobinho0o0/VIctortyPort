@@ -5270,8 +5270,10 @@ impl<'a> Lower<'a> {
                 regs.extend((0..dwords).map(|k| reg + k));
             }
         }
-        // Full 32-bit address VGPR (offsets, bias, comparison reference stay
-        // 32-bit even when `a16` packs the remaining coordinates/gradients/LOD).
+        // Full 32-bit address VGPR (offsets, comparison reference and, outside
+        // the `_g16` opcodes, derivatives stay 32-bit when `a16` packs the
+        // coordinates and LOD; the bias keeps its own dword but is an f16 in
+        // the low half).
         let addr_dword = |l: &mut Self, idx: usize| -> Result<V, Why> {
             let r = *regs.get(idx).ok_or("an image address")?;
             let v = inst.read(Reg::V(r)).ok_or("an image address")?;
@@ -5501,9 +5503,11 @@ impl<'a> Lower<'a> {
             let first =
                 usize::from(offset_word) + usize::from(name == "image_sample_b") + usize::from(cmp);
             // Coordinates the size divides (not the array slice); explicit
-            // gradients (x then y) come before the coordinates.
+            // gradients (x then y, one 32-bit dword each even with a16) come
+            // before the coordinates.
             let spatial = coords - usize::from(kind == 6 || kind == 7);
             let grads = if op == 63 { 2 * spatial } else { 0 };
+            let at = first + grads;
             let mut cs = vec![fu; 4];
             // With a16, sampling coordinates and LOD are f16.
             let to_float = |l: &mut Self, x: V| {
@@ -5515,7 +5519,7 @@ impl<'a> Lower<'a> {
                 }
             };
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
-                let x = addr_val(self, first, grads + k)?;
+                let x = addr_val(self, at, k)?;
                 *slot = to_float(self, x);
             }
             if kind == 5 {
@@ -5584,8 +5588,9 @@ impl<'a> Lower<'a> {
                         .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
                 }
                 61 => {
-                    let bias = addr_dword(self, usize::from(offset_word))?;
-                    let bias = self.as_float(bias);
+                    // With a16, an f16 in the low half of its own dword.
+                    let bias = addr_val(self, usize::from(offset_word), 0)?;
+                    let bias = to_float(self, bias);
                     args.extend(&os);
                     args.extend([bias, fu]);
                     self.s.op(
@@ -5600,10 +5605,10 @@ impl<'a> Lower<'a> {
                 63 => {
                     let mut g = vec![fu; 6];
                     for k in 0..spatial {
-                        let x = addr_val(self, first, k)?;
-                        g[k] = to_float(self, x);
-                        let y = addr_val(self, first, spatial + k)?;
-                        g[3 + k] = to_float(self, y);
+                        let x = addr_dword(self, first + k)?;
+                        g[k] = self.as_float(x);
+                        let y = addr_dword(self, first + spatial + k)?;
+                        g[3 + k] = self.as_float(y);
                     }
                     args.extend(&os);
                     args.extend(g);
@@ -5633,7 +5638,7 @@ impl<'a> Lower<'a> {
                 }
                 62 => {
                     let lod = if name == "image_sample_l" {
-                        let x = addr_val(self, first, coords)?;
+                        let x = addr_val(self, at, coords)?;
                         to_float(self, x)
                     } else {
                         self.s.m.f32(0)

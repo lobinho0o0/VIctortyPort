@@ -790,6 +790,7 @@ fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
         _ => {}
     }
     let (mut whole, mut derivs, mut packed): (u8, u8, u8) = (0, 0, coords);
+    let mut g16 = false;
     if let Some(rest) = name
         .strip_prefix("image_sample")
         .or_else(|| name.strip_prefix("image_gather4"))
@@ -799,15 +800,36 @@ fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
                 "o" | "b" | "c" => whole += 1,
                 "d" | "cd" => derivs = grads,
                 "l" | "cl" => packed += 1,
+                "g16" => g16 = true,
                 _ => {}
             }
         }
     } else if name.contains("_mip") {
         packed += 1;
     }
-    if a16 {
-        whole + 2 * derivs.div_ceil(2) + packed.div_ceil(2)
+    // Derivatives are 16-bit (each direction padded to a dword) only in the
+    // `_g16` opcodes; `a16` alone leaves them 32-bit and packs the rest.
+    let derivs = if g16 {
+        2 * derivs.div_ceil(2)
     } else {
-        whole + 2 * derivs + packed
+        2 * derivs
+    };
+    whole + derivs + if a16 { packed.div_ceil(2) } else { packed }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::image_addr_dwords;
+
+    #[test]
+    fn a16_keeps_derivatives_32bit_outside_g16() {
+        // 2D: four 32-bit derivatives plus the packed (u, v).
+        assert_eq!(image_addr_dwords("image_sample_d", 1, true), 5);
+        assert_eq!(image_addr_dwords("image_sample_d", 1, false), 6);
+        // g16: one dword per direction, then the coordinates.
+        assert_eq!(image_addr_dwords("image_sample_d_g16", 1, true), 3);
+        assert_eq!(image_addr_dwords("image_sample_d_g16", 1, false), 4);
+        // The bias keeps its own dword with a16.
+        assert_eq!(image_addr_dwords("image_sample_b", 1, true), 2);
     }
 }
