@@ -87,9 +87,11 @@ fn resolve(path: &Path) -> Result<PathBuf, PolicyError> {
                 }
                 return Ok(normalize(&out));
             }
-            Err(source) => match (existing.parent(), existing.file_name()) {
-                (Some(parent), Some(name)) => {
-                    rest.push(name.to_os_string());
+            // The last component, not `file_name`: that is `None` for `..`,
+            // which a path may well hold below a directory not created yet.
+            Err(source) => match (existing.parent(), existing.components().next_back()) {
+                (Some(parent), Some(name @ (Component::Normal(_) | Component::ParentDir))) => {
+                    rest.push(name.as_os_str().to_os_string());
                     existing = parent;
                 }
                 _ => {
@@ -142,6 +144,24 @@ mod tests {
             .join("not-yet-created")
             .join("out");
         assert!(ensure_outside_repo(&path).is_err());
+    }
+
+    #[test]
+    fn resolves_dotdot_after_a_missing_directory() {
+        // `Path::file_name` is `None` for a path ending in `..`, so the walk
+        // up to an existing prefix has to keep that component too.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("missing").join("..").join("cache");
+        ensure_outside_repo(&path).unwrap();
+
+        let inside = compiled_workspace_root()
+            .join("not-yet-created")
+            .join("..")
+            .join("out");
+        assert!(matches!(
+            ensure_outside_repo(&inside),
+            Err(PolicyError::InsideRepo { .. })
+        ));
     }
 
     #[test]

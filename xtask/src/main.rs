@@ -54,3 +54,29 @@ fn workspace_root() -> PathBuf {
         .expect("xtask lives in the workspace")
         .into()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Git on Linux and macOS skips a hook that is not executable (with only
+    /// a hint), so the policy check would silently never run there.
+    #[test]
+    fn hooks_are_tracked_executable() {
+        let out = policy::git_command(&workspace_root())
+            .args(["ls-files", "--stage", "--", ".githooks"])
+            .output();
+        let Some(out) = out.ok().filter(|o| o.status.success()) else {
+            eprintln!("skipped: not a git checkout");
+            return;
+        };
+        let listing = String::from_utf8(out.stdout).unwrap();
+        assert!(!listing.is_empty(), ".githooks/ holds no tracked hooks");
+        for line in listing.lines() {
+            assert!(
+                line.starts_with("100755 "),
+                "hook not executable in git (git update-index --chmod=+x): {line}"
+            );
+        }
+    }
+}
