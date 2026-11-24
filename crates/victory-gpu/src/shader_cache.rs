@@ -37,8 +37,9 @@ pub(crate) fn counts() -> (u64, u64) {
 }
 
 /// What identifies this build: the BLAKE3 of our executable file and of
-/// the translation settings it runs with (the loop limit, which a
-/// diagnostics build can change at run time).
+/// the translation settings it runs with (the loop and spin-wait limits,
+/// which `VICTORY_SHADER_LOOP_LIMIT` and `VICTORY_SHADER_SPIN_LIMIT`
+/// change at run time).
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
@@ -50,9 +51,17 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
+        let spin = victory_shader::emit::spin_limit();
+        if spin != victory_shader::emit::DEFAULT_SPIN_LIMIT {
+            tracing::warn!(
+                spin,
+                "VICTORY_SHADER_SPIN_LIMIT: spin-wait loops stop at this count"
+            );
+        }
         match exe {
             Ok(mut bytes) => {
                 bytes.extend_from_slice(&limit.to_le_bytes());
+                bytes.extend_from_slice(&spin.to_le_bytes());
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {
