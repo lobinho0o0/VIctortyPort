@@ -5,7 +5,7 @@
 //! `v_med3_f32`/`v_med3_f16` with NaN operands, `v_fract_f32`/`v_fract_f16`
 //! near `1.0`, and turn-range reduction for `v_sin_*`/`v_cos_*`.
 
-use super::host::{Dispatch, Host, Root, View};
+use super::host::{Dispatch, Host, Root, Stride, View};
 use super::{HostShader, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
@@ -122,12 +122,16 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         code,
     };
 
+    lower_compute(&native)
+}
+
+fn lower_compute(native: &NativeProgram) -> HostShader {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let res = resource::track(&p, &native.layout, native.stage).expect("resource::track");
-    let io = io::raise(&p, &native).expect("io::raise");
+    let io = io::raise(&p, native).expect("io::raise");
     let st = structure::structure(&p).expect("structure");
     let lowered = lower::lower(&lower::Parts {
-        native: &native,
+        native,
         p: &p,
         st: &st,
         io: &io,
@@ -201,6 +205,93 @@ fn run_cases(
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+#[test]
+fn scalar_buffer_load_uses_byte_offsets_with_a_raw_host_view() {
+    let input = s_load_dwordx4(4, 0);
+    let mut output = s_load_dwordx4(8, 0);
+    output[1] |= 32; // second heap slot
+    let store = buffer_store_dword(0, 8, 0);
+    let words = [
+        s_mov_b32(1, 0x80),
+        input[0],
+        input[1],
+        output[0],
+        output[1],
+        // s_buffer_load_dword s12, s[4:7], 20
+        0x3D << 26 | 0x08 << 18 | 12 << 6 | 2,
+        125 << 25 | 20,
+        vop1(0x001, 0, sgpr(12)),
+        store[0],
+        store[1],
+        S_ENDPGM,
+    ];
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 4,
+        layout: vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: vec![
+            UsedResource {
+                kind: ResourceType::Srv,
+                stride: 16,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            },
+            UsedResource {
+                kind: ResourceType::Uav,
+                stride: 0,
+                root: RootType::Table,
+                table_offset_dwords: 8,
+                lower_bound: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            },
+        ],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 1 << 1,
+            threads: [1, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let shader = lower_compute(&native);
+    let data = [81, 82, 83, 84, 85, 86, 87, 88];
+    let host = Host::new(false)
+        .or_else(|_| Host::new(true))
+        .expect("SM 6.6 device");
+    let (root, pipeline) = host.compute_pipeline(&shader).unwrap();
+    let out = host
+        .dispatch(
+            &root,
+            &pipeline,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords() as usize]))],
+                views: &[
+                    View::Buffer {
+                        data: &data,
+                        stride: Stride::Raw,
+                    },
+                    View::RawUav(1),
+                ],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .expect("dispatch scalar load");
+    assert_eq!(out[0], [86], "byte offset 20 in the raw host view");
 }
 
 fn is_f16_nan(bits: u16) -> bool {
