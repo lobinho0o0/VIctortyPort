@@ -236,12 +236,15 @@ impl Staging {
                 "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
             );
         }
-        for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
+        let items: Vec<(usize, &D3D12_PLACED_SUBRESOURCE_FOOTPRINT, u32)> =
+            self.footprints.iter().zip(&self.rows).enumerate().map(|(i, (f, &r))| (i, f, r)).collect();
+        let detile_one = |(i, footprint, rows): (usize, &D3D12_PLACED_SUBRESOURCE_FOOTPRINT, u32)| {
             let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
             let len = pitch * rows as usize * f.Depth as usize;
-            // SAFETY: the subresource's part of the mapped staging buffer.
+            // SAFETY: the subresource's part of the mapped staging buffer;
+            // footprints have non-overlapping offsets (D3D12 guarantees it).
             let linear = unsafe {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
             };
@@ -250,8 +253,16 @@ impl Staging {
                     .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
             {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
-                return;
             }
+        };
+        if items.len() > 1 {
+            std::thread::scope(|s| {
+                for item in &items {
+                    s.spawn(|| detile_one(*item));
+                }
+            });
+        } else if let Some(item) = items.into_iter().next() {
+            detile_one(item);
         }
     }
 }

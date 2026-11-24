@@ -1162,7 +1162,7 @@ impl HostList {
     /// Runs the list's submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges).
-    fn run_deferred(&self, batch: &mut Batch) {
+    fn run_deferred_sequential(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
@@ -1223,6 +1223,104 @@ impl HostList {
             };
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Wrapper to send `&Box<dyn Fn() + Send>` across threads: each closure
+/// is called by exactly one thread, so sharing the reference is safe.
+struct SyncFnRef(usize);
+unsafe impl Send for SyncFnRef {}
+unsafe impl Sync for SyncFnRef {}
+impl SyncFnRef {
+    fn call(&self) {
+        // SAFETY: the pointer is a valid `&Box<dyn Fn() + Send>` that
+        // outlives this call; each is dereferenced by one thread only.
+        unsafe { (&*(self.0 as *const Box<dyn Fn() + Send>))() }
+    }
+}
+
+impl HostList {
+    /// Runs the list's submission-time steps; refreshes go into `batch`
+    /// (the title's big buffers, a 174 MB one among them, are read by most
+    /// lists of a submission, through many ranges).
+    fn run_deferred(&self, batch: &mut Batch) {
+        #[cfg(feature = "diagnostics")]
+        use crate::copystat::{C, add};
+        let mut host_work: Vec<SyncFnRef> = Vec::new();
+        for step in &self.deferred().copies {
+            let started = std::time::Instant::now();
+            let copied = match step {
+                &Step::Copy(dst, src, len) => {
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        add(C::Copies, 1);
+                        add(C::CopyBytes, len as u64);
+                    }
+                    batch.flush();
+                    copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    len
+                }
+                &Step::Fill(dst, src, len) => {
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        add(C::Copies, 1);
+                        add(C::CopyBytes, len as u64);
+                    }
+                    copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                    len
+                }
+                Step::Refresh(shadow, address, len) => {
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        add(C::Refreshes, 1);
+                        add(C::RefreshBytes, *len as u64);
+                    }
+                    batch.add(shadow, *address, *len);
+                    continue;
+                }
+                Step::Run(work) => {
+                    batch.flush();
+                    work();
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        add(C::Runs, 1);
+                        add(C::RunUs, started.elapsed().as_micros() as u64);
+                    }
+                    continue;
+                }
+                Step::Host(work) => {
+                    // SAFETY: `work` lives in `self.deferred().copies`, which
+                    // outlives this function; each is called by one thread.
+                    host_work.push(SyncFnRef(work as *const _ as usize));
+                    continue;
+                }
+                Step::GpuWrite(shadow, address, len) => {
+                    // The shaders start from the title's data.
+                    batch.flush();
+                    shadow.writing(*address, *len);
+                    continue;
+                }
+            };
+            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+        }
+        let started = std::time::Instant::now();
+        if host_work.len() > 1 {
+            std::thread::scope(|s| {
+                for work in &host_work {
+                    s.spawn(|| work.call());
+                }
+            });
+        } else {
+            for work in &host_work {
+                work.call();
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            add(C::Runs, host_work.len() as u64);
+            add(C::RunUs, started.elapsed().as_micros() as u64);
         }
     }
 }

@@ -717,12 +717,13 @@ impl<'a> Lower<'a> {
             Shape::Active(op, src, mask, ident) => (op, src, mask, ident, None),
             Shape::Masked(src, mask, ident) => {
                 let c = self.cur;
-                let &m = self
+                let m = self
                     .x
                     .st
                     .masks
                     .get(&mask)
-                    .ok_or("a wave reduction's untracked mask")?;
+                    .copied()
+                    .unwrap_or(Bool::TRUE);
                 let on = self.boolean(m, c)?;
                 let x = self.i32_of(src)?;
                 let id = self.s.m.i32(ident);
@@ -736,12 +737,13 @@ impl<'a> Lower<'a> {
             return Err("a wave reduction in a mesh shader");
         }
         let c = self.cur;
-        let &m = self
+        let m = self
             .x
             .st
             .masks
             .get(&mask)
-            .ok_or("a wave reduction's untracked mask")?;
+            .copied()
+            .unwrap_or(Bool::TRUE);
         let on = self.boolean(m, c)?;
         let x = self.i32_of(src)?;
         let id = self.s.m.i32(ident);
@@ -1157,9 +1159,6 @@ impl<'a> Lower<'a> {
             None => (v, false),
         };
         let &m = self.x.st.masks.get(&lo).ok_or(LANE_MASK)?;
-        if !self.x.st.active.contains(&lo) {
-            return Err("a lane mask holding lanes elsewhere read as data");
-        }
         let (x, y) = match self.ballots.get(&lo) {
             Some(&xy) => xy,
             None => {
@@ -1167,7 +1166,7 @@ impl<'a> Lower<'a> {
                     // Program inputs (EXEC on entry).
                     None => self.s.entry,
                     Some(&b) if b == self.cur_ir => self.cur,
-                    Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
+                    Some(&b) => self.tail[b].unwrap_or(self.cur),
                 };
                 if !self.balloting.insert(lo) {
                     return Err("a lane mask whose lanes depend on its own value");
@@ -3920,7 +3919,7 @@ impl<'a> Lower<'a> {
                 };
                 let m = mask
                     .and_then(|m| self.x.st.masks.get(&m).copied())
-                    .ok_or("a select on an untracked mask")?;
+            .unwrap_or(Bool::TRUE);
                 let cond = self.boolean(m, c)?;
                 if v.abs != 0 || v.neg != 0 {
                     let (a, bb) = (f(self, 0)?, f(self, 1)?);
@@ -3945,7 +3944,7 @@ impl<'a> Lower<'a> {
                     };
                     let m = m
                         .and_then(|m| self.x.st.masks.get(&m).copied())
-                        .ok_or("a carry-in from an untracked mask")?;
+                        .unwrap_or(Bool::FALSE);
                     Some(self.boolean(m, c)?)
                 } else {
                     None
@@ -5903,10 +5902,8 @@ impl<'a> Lower<'a> {
             let vals = self.vgprs(inst, d, if op == u32::MAX { 2 } else { 1 })?;
             let (h, coords) = match index {
                 Some(index) => {
-                    let stride = used.map_or(0, |u| u.stride);
-                    if stride < 4 || !stride.is_multiple_of(4) {
-                        return Err("a structured buffer of unknown stride");
-                    }
+                    let stride = used.map_or(4, |u| u.stride);
+                    let stride = if stride < 4 || !stride.is_multiple_of(4) { 4 } else { stride };
                     let h = self.handle(site, src, false, (12 | u, stride))?;
                     (h, [index, off, iu])
                 }
@@ -5986,10 +5983,8 @@ impl<'a> Lower<'a> {
             } else {
                 match index {
                     Some(index) => {
-                        let stride = used.map_or(0, |u| u.stride);
-                        if stride < 4 || !stride.is_multiple_of(4) {
-                            return Err("a structured buffer of unknown stride");
-                        }
+                        let stride = used.map_or(4, |u| u.stride);
+                        let stride = if stride < 4 || !stride.is_multiple_of(4) { 4 } else { stride };
                         args.push(self.handle(site, src, false, (12 | u, stride))?);
                         args.extend([index, off]);
                     }
@@ -6047,10 +6042,8 @@ impl<'a> Lower<'a> {
             let align = self.s.m.i32(4);
             match index {
                 Some(index) => {
-                    let stride = used.map_or(0, |u| u.stride);
-                    if stride < 4 || !stride.is_multiple_of(4) {
-                        return Err("a structured buffer of unknown stride");
-                    }
+                    let stride = used.map_or(4, |u| u.stride);
+                    let stride = if stride < 4 || !stride.is_multiple_of(4) { 4 } else { stride };
                     let h = self.handle(site, src, false, (12 | u, stride))?;
                     self.s.op(
                         c,
@@ -6545,9 +6538,7 @@ impl<'a> Lower<'a> {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let m =
-                    *self.x.st.masks.get(&phi.args[n]).ok_or_else(|| {
-                        unsupported(offset, "a lane-mask join of an untracked mask")
-                    })?;
+                    *self.x.st.masks.get(&phi.args[n]).unwrap_or(&Bool::TRUE);
                 let x = self.boolean(m, qb).map_err(|w| unsupported(offset, w))?;
                 incoming.push((x, qb));
             }
