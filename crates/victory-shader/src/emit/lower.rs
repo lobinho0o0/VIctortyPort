@@ -177,6 +177,9 @@ struct Lower<'a> {
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword, and the row packed after it.
     half_outputs: HashMap<u8, (bool, Option<u8>)>,
+    /// Pixel inputs holding 16-bit values: row, whether two per dword, and
+    /// the row packed after it.
+    half_inputs: HashMap<u8, (bool, Option<u8>)>,
     /// How lane masks become data.
     mask_data: MaskData,
     /// The instruction being lowered may read lane masks as data.
@@ -317,6 +320,60 @@ fn half_outputs(io: &StageIo, outputs: &[SigElement]) -> HashMap<u8, (bool, Opti
             (o.row, (o.pack2, b.map(|i| free.remove(i))))
         })
         .collect()
+}
+
+/// Pixel inputs of 16-bit values (see [`Lower::half_inputs`]): a packed row's
+/// partner is `row2` when distinct from `row`, else the next unlisted 16-bit
+/// row of the signature before the next `fp16` input row, taken in row order.
+fn half_inputs(io: &StageIo, inputs: &[SigElement]) -> HashMap<u8, (bool, Option<u8>)> {
+    let StageIo::Ps {
+        inputs: entries, ..
+    } = io
+    else {
+        return HashMap::new();
+    };
+    // Keep the first fp16 entry per row (matching the previous `.find()`
+    // behaviour) so duplicate rows neither overwrite earlier ones nor consume
+    // an extra free partner row.
+    let mut seen = HashSet::new();
+    let mut halves: Vec<_> = entries
+        .iter()
+        .filter(|i| i.fp16 && seen.insert(i.row))
+        .collect();
+    halves.sort_by_key(|i| i.row);
+    // In the console's PsInput table, `row2` repeats `row` when no distinct
+    // partner row is named; exclude both listed rows and explicitly claimed
+    // partners (`row2 != row`) from the fallback pool.
+    let mut free: Vec<u8> = inputs
+        .iter()
+        .filter(|e| e.half && e.kind == 0)
+        .filter_map(|e| u8::try_from(e.row?).ok())
+        .filter(|&r| {
+            !entries.iter().any(|i| i.row == r)
+                && !halves
+                    .iter()
+                    .any(|i| i.pack2 && i.row2 != i.row && i.row2 == r)
+        })
+        .collect();
+    free.sort_unstable();
+    free.dedup();
+    let mut out = HashMap::with_capacity(halves.len());
+    for (idx, i) in halves.iter().enumerate() {
+        let next_fp16 = halves.get(idx + 1).map_or(u8::MAX, |n| n.row);
+        // Only take a fallback partner before the next fp16 input row so an
+        // earlier unpaired input cannot steal a later fp16 input's partner.
+        let b = if !i.pack2 {
+            None
+        } else if i.row2 != i.row {
+            Some(i.row2)
+        } else {
+            free.iter()
+                .position(|&r| r > i.row && r < next_fp16)
+                .map(|p| free.remove(p))
+        };
+        out.insert(i.row, (i.pack2, b));
+    }
+    out
 }
 
 fn unsupported(offset: usize, what: Why) -> Stop {
@@ -470,6 +527,7 @@ impl<'a> Lower<'a> {
             flat: None,
             no_barrier,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
+            half_inputs: half_inputs(&x.native.io, &x.inputs),
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
                 HwStage::Ps | HwStage::Vs => MaskData::Host,
@@ -5146,13 +5204,7 @@ impl<'a> Lower<'a> {
                 _ => Err("an input"),
             }
         };
-        let packing = match &self.x.native.io {
-            StageIo::Ps { inputs, .. } => inputs
-                .iter()
-                .find(|i| i.row == attribute.row && i.fp16)
-                .map(|i| (i.pack2, (i.row2 != i.row).then_some(i.row2))),
-            _ => None,
-        };
+        let packing = self.half_inputs.get(&attribute.row).copied();
         let f16 = inst.name().ends_with("_f16");
         let x = match packing {
             None if f16 || attribute.high => return Err("a 16-bit read of a 32-bit input"),
@@ -6649,5 +6701,78 @@ mod tests {
         assert_eq!(buffer_format(0), None);
         assert_eq!(buffer_format(36), None);
         assert_eq!(buffer_format(78), None);
+    }
+
+    #[test]
+    fn packed_half_inputs_pair_unlisted_rows() {
+        use super::super::container::SigElement;
+        use super::half_inputs;
+        use crate::native::{PsInput, StageIo, Usage};
+
+        let sig = |row: u32, half: bool| SigElement {
+            name: "TEXCOORD".into(),
+            index: row,
+            kind: 0,
+            comp: 9,
+            interp: 0,
+            row: Some(row),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half,
+        };
+        let ps_in = |row: u8, attr: u8, pack2: bool, row2: u8| PsInput {
+            usage: Usage::Generic,
+            row,
+            mask: 3,
+            attr,
+            flat: false,
+            fp16: true,
+            pack2,
+            row2,
+        };
+        // Row 0 has row2 == row (0) and pairs with unlisted row 1;
+        // row 2 explicitly names row2 == 4 (not stolen by row 0);
+        // row 5 has row2 == row (5) and no remaining unlisted row after it.
+        let inputs = vec![
+            sig(0, true),
+            sig(1, true),
+            sig(2, true),
+            sig(3, false),
+            sig(4, true),
+            sig(5, true),
+        ];
+        let io = StageIo::Ps {
+            inputs: vec![
+                ps_in(0, 0, true, 0),
+                ps_in(2, 1, true, 4),
+                ps_in(5, 3, true, 5),
+            ],
+            input_addr: 0,
+            db_shader_control: 0,
+            patches: vec![],
+        };
+        let map = half_inputs(&io, &inputs);
+        assert_eq!(map.get(&0), Some(&(true, Some(1))));
+        assert_eq!(map.get(&2), Some(&(true, Some(4))));
+        assert_eq!(map.get(&5), Some(&(true, None)));
+
+        // Duplicate entries for the same row keep the first entry and do not
+        // consume an extra free row; an earlier unpaired row (0) must not steal
+        // a free row (3) that comes after a later fp16 row (2).
+        let inputs2 = vec![sig(0, true), sig(2, true), sig(3, true)];
+        let io2 = StageIo::Ps {
+            inputs: vec![
+                ps_in(0, 0, true, 0),
+                ps_in(0, 9, false, 0),
+                ps_in(2, 1, true, 2),
+            ],
+            input_addr: 0,
+            db_shader_control: 0,
+            patches: vec![],
+        };
+        let map2 = half_inputs(&io2, &inputs2);
+        assert_eq!(map2.get(&0), Some(&(true, None)));
+        assert_eq!(map2.get(&2), Some(&(true, Some(3))));
     }
 }
