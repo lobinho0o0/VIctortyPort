@@ -76,6 +76,200 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     }
 }
 
+/// Private memory per lane when the code does not show how far its
+/// addresses reach (an index loaded or carried around a loop).
+// shortcut: the console's size is set at pipeline creation (the program
+// metadata read so far does not hold it); accesses past this read 0 and
+// drop writes, as accesses past the console's size do.
+pub(super) const SCRATCH_CAP: u32 = 4 << 10;
+/// The most private memory per lane, the D3D11 limit of indexable
+/// temporaries (4096 four-dword registers).
+// shortcut: accesses past it read 0 and drop writes.
+const SCRATCH_MAX: u32 = 64 << 10;
+
+/// Bytes a `scratch_*` opcode moves (per lane), from the name after
+/// `scratch_load_` or `scratch_store_`.
+fn scratch_width(rest: &str) -> Option<u32> {
+    Some(match rest.split('_').next()? {
+        "dword" => 4,
+        "dwordx2" => 8,
+        "dwordx3" => 12,
+        "dwordx4" => 16,
+        "byte" | "ubyte" | "sbyte" => 1,
+        "short" | "ushort" | "sshort" => 2,
+        _ => return None,
+    })
+}
+
+/// Private memory per lane the program needs: past the highest byte its
+/// scratch accesses can reach where the code computing their addresses
+/// bounds them, else [`SCRATCH_CAP`]; at most [`SCRATCH_MAX`].
+fn scratch_bytes(p: &Program) -> u32 {
+    let mut defs = HashMap::new();
+    for i in p.blocks.iter().flat_map(|b| &b.insts) {
+        for &(_, v) in &i.writes {
+            defs.insert(v, i);
+        }
+    }
+    let mut memo = HashMap::new();
+    let mut end = 0u64;
+    for i in p.blocks.iter().flat_map(|b| &b.insts) {
+        let name = i.name();
+        let Fields::Flat {
+            addr,
+            saddr,
+            offset,
+            ..
+        } = &i.fields
+        else {
+            continue;
+        };
+        let rest = name
+            .strip_prefix("scratch_load_")
+            .or_else(|| name.strip_prefix("scratch_store_"));
+        let Some(width) = rest.and_then(scratch_width) else {
+            continue;
+        };
+        let base = match (addr, saddr) {
+            (Some(o), _) | (None, Some(o)) => operand_bound(&defs, &mut memo, i, o, 0),
+            (None, None) => Some(0),
+        };
+        // A negative offset only lowers the address (or wraps it out of
+        // range, checked when the program runs).
+        let off = u64::from((*offset).max(0).unsigned_abs());
+        end = end.max(base.map_or(u64::from(SCRATCH_CAP), |b| b + off + u64::from(width)));
+    }
+    end.min(u64::from(SCRATCH_MAX)) as u32
+}
+
+/// An upper bound of operand `o` of `inst` as an unsigned number.
+fn operand_bound(
+    defs: &HashMap<Value, &Inst>,
+    memo: &mut HashMap<Value, Option<u64>>,
+    inst: &Inst,
+    o: &Operand,
+    depth: u8,
+) -> Option<u64> {
+    match *o {
+        Operand::Scalar { code: NULL, .. } => Some(0),
+        Operand::Scalar { code, .. } => value_bound(defs, memo, inst.read(Reg::S(code))?, depth),
+        Operand::Vector { reg, .. } => value_bound(defs, memo, inst.read(Reg::V(reg))?, depth),
+        Operand::Const(c) => crate::resource::inline(c).map(u64::from),
+        Operand::Literal(x) => Some(u64::from(x)),
+        Operand::Attr { .. } => None,
+    }
+}
+
+/// An upper bound of 32-bit value `v` as an unsigned number, where the
+/// instructions computing it show one (constants combined by masks, shifts,
+/// sums, products, selects); `None` where it depends on anything else
+/// (inputs, memory, a phi) or may wrap.
+fn value_bound(
+    defs: &HashMap<Value, &Inst>,
+    memo: &mut HashMap<Value, Option<u64>>,
+    v: Value,
+    depth: u8,
+) -> Option<u64> {
+    if let Some(&b) = memo.get(&v) {
+        return b;
+    }
+    let inst = *defs.get(&v)?;
+    if depth > 32 {
+        return None;
+    }
+    let (dst, src) = match &inst.fields {
+        Fields::Sop {
+            dst: Some(Operand::Scalar { code, .. }),
+            src,
+            imm: None,
+        } => (Reg::S(*code), src),
+        Fields::Valu(x)
+            if x.sdwa.is_none()
+                && x.dpp.is_none()
+                && x.neg | x.abs | x.opsel == 0
+                && !x.clamp
+                && x.omod == 0 =>
+        {
+            match x.dst {
+                Some(Operand::Vector { reg, .. }) => (Reg::V(reg), &x.src),
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    if inst.write(dst) != Some(v) {
+        return None;
+    }
+    let mut arg =
+        |k: usize| -> Option<u64> { operand_bound(defs, memo, inst, src.get(k)?, depth + 1) };
+    // The smallest all-ones number at least `x` (bounds `|` and `^`).
+    let ones = |x: u64| {
+        if x == 0 {
+            0
+        } else {
+            u64::MAX >> x.leading_zeros()
+        }
+    };
+    let u24 = |x: Option<u64>| x.map(|x| x.min(0xFF_FFFF));
+    let shl = |x: Option<u64>, n: Option<u64>| -> Option<u64> {
+        x?.checked_shl(u32::try_from(n.filter(|&n| n < 32)?).ok()?)
+    };
+    let b = match inst.name() {
+        "v_mov_b32" | "s_mov_b32" => arg(0),
+        "v_and_b32" | "s_and_b32" => match (arg(0), arg(1)) {
+            (Some(x), Some(y)) => Some(x.min(y)),
+            (x, y) => x.or(y),
+        },
+        "v_or_b32" | "s_or_b32" | "v_xor_b32" | "s_xor_b32" => Some(ones(arg(0)?.max(arg(1)?))),
+        "v_lshlrev_b32" => {
+            let n = arg(0);
+            shl(arg(1), n)
+        }
+        "s_lshl_b32" => {
+            let x = arg(0);
+            shl(x, arg(1))
+        }
+        "v_lshrrev_b32" => arg(1),
+        "s_lshr_b32" => arg(0),
+        "v_add_nc_u32" | "v_add_u32" | "v_add_co_u32" | "s_add_u32" | "s_add_i32" => {
+            Some(arg(0)? + arg(1)?)
+        }
+        "v_add3_u32" => Some(arg(0)? + arg(1)? + arg(2)?),
+        "v_mul_u32_u24" => Some(u24(arg(0))? * u24(arg(1))?),
+        "v_mul_lo_u32" | "s_mul_i32" => arg(0)?.checked_mul(arg(1)?),
+        "v_mad_u32_u24" => Some(u24(arg(0))? * u24(arg(1))? + arg(2)?),
+        "v_lshl_add_u32" | "v_lshl_or_b32" => {
+            let x = arg(0);
+            let n = arg(1);
+            Some(shl(x, n)? + arg(2)?)
+        }
+        "v_add_lshl_u32" => {
+            let x = Some(arg(0)? + arg(1)?);
+            shl(x, arg(2))
+        }
+        "v_and_or_b32" => {
+            let x = match (arg(0), arg(1)) {
+                (Some(x), Some(y)) => x.min(y),
+                (x, y) => x.or(y)?,
+            };
+            Some(x + arg(2)?)
+        }
+        "v_bfe_u32" => match arg(2) {
+            Some(w) if w < 32 => Some((1 << w) - 1),
+            _ => arg(0),
+        },
+        "v_cndmask_b32" | "v_max_u32" | "s_max_u32" | "s_cselect_b32" => Some(arg(0)?.max(arg(1)?)),
+        "v_min_u32" | "s_min_u32" => match (arg(0), arg(1)) {
+            (Some(x), Some(y)) => Some(x.min(y)),
+            (x, y) => x.or(y),
+        },
+        _ => None,
+    }
+    .filter(|&b| b <= u64::from(u32::MAX));
+    memo.insert(v, b);
+    b
+}
+
 const TWO_PI: f32 = std::f32::consts::TAU;
 /// `s_sendmsg` id of a mesh or NGG stage's output allocation request.
 const GS_ALLOC_REQ: u16 = 9;
@@ -198,6 +392,8 @@ struct Lower<'a> {
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
+    /// Private (scratch) memory: the lane's array and its dwords.
+    scratch: Option<(V, u32)>,
     /// Loop headers' iteration counters (see [`LOOP_LIMIT`]): the phi by
     /// IR block, and its incoming (value, DXIL block) pairs.
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
@@ -494,6 +690,7 @@ impl<'a> Lower<'a> {
             sections: HashMap::new(),
             section_out: HashSet::new(),
             code_table: None,
+            scratch: None,
             counters: HashMap::new(),
             abort: None,
         }
@@ -556,6 +753,153 @@ impl<'a> Lower<'a> {
         let index = self.s.m.select(c, over, last, index);
         let at = self.s.m.element(c, g, index);
         Ok(self.s.m.load(c, at))
+    }
+
+    /// Private (scratch) memory, `scratch_load_*` and `scratch_store_*`.
+    /// Each lane has its own: the address (VGPR, SGPR or none, plus the
+    /// offset) is a byte offset into the lane's memory, and the hardware
+    /// interleaves the lanes' dwords itself (RDNA 2 ISA, "Scratch
+    /// (Private)"; LLVM AMDGPUUsage, "Private Segment"). On the host it is
+    /// an array of dwords per lane (`alloca`, as DXC makes local arrays).
+    // shortcut: a dword access is taken as aligned, a byte or short one
+    // not to cross a dword (console compilers keep private data aligned).
+    fn scratch(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
+        let Fields::Flat {
+            dst,
+            addr,
+            data,
+            saddr,
+            offset,
+            lds,
+            ..
+        } = &inst.fields
+        else {
+            unreachable!()
+        };
+        if *lds {
+            return Err("a scratch load into LDS");
+        }
+        let name = inst.name();
+        let (load, rest) = match name.strip_prefix("scratch_load_") {
+            Some(rest) => (true, rest),
+            None => (false, name.strip_prefix("scratch_store_").ok_or(name)?),
+        };
+        let width = scratch_width(rest).ok_or(name)?;
+        let (signed, hi) = (rest.starts_with('s'), rest.ends_with("_hi"));
+        let guard = self.guard(b, i)?;
+        let base = match (addr, saddr) {
+            (Some(o), _) => self.vgprs(inst, o, 1)?[0],
+            (None, Some(o)) => self.operand(inst, o)?,
+            (None, None) => self.s.m.i32(0),
+        };
+        let (arr, dwords) = match self.scratch {
+            Some(a) => a,
+            None => {
+                let dwords = scratch_bytes(self.x.p).div_ceil(4);
+                let ty = self.s.m.array(dwords, self.s.t.i32);
+                let a = (self.s.m.alloca(self.s.entry, ty), dwords);
+                self.scratch = Some(a);
+                a
+            }
+        };
+        let c = self.cur;
+        let off = self.s.m.i32(i32::from(*offset) as u32);
+        let at = self.s.m.bin(c, Bin::Add, base, off);
+        let two = self.s.m.i32(2);
+        let first = self.s.m.bin(c, Bin::LShr, at, two);
+        // Dword `k` of the access: its element (the first when out of
+        // range) and whether it is in range.
+        let element = |l: &mut Self, k: u32| -> (V, V) {
+            let c = l.cur;
+            let k = l.s.m.i32(k);
+            let index = l.s.m.bin(c, Bin::Add, first, k);
+            let n = l.s.m.i32(dwords);
+            let inside = l.s.m.cmp(c, pred::IULT, index, n);
+            let zero = l.s.m.i32(0);
+            let index = l.s.m.select(c, inside, index, zero);
+            (l.s.m.element(c, arr, index), inside)
+        };
+        let three = self.s.m.i32(3);
+        let byte = self.s.m.bin(c, Bin::And, at, three);
+        let shift = self.s.m.bin(c, Bin::Shl, byte, three);
+        if load {
+            let Some(Operand::Vector { reg, .. }) = *dst else {
+                return Err("a scratch load result");
+            };
+            let zero = self.s.m.i32(0);
+            if width >= 4 {
+                for k in 0..width / 4 {
+                    let (p, inside) = element(self, k);
+                    let x = self.s.m.load(c, p);
+                    let x = self.s.m.select(c, inside, x, zero);
+                    self.write(inst, Reg::V(reg + k as u8), x, guard);
+                }
+                return Ok(());
+            }
+            let (p, inside) = element(self, 0);
+            let w = self.s.m.load(c, p);
+            let w = self.s.m.select(c, inside, w, zero);
+            let x = self.s.m.bin(c, Bin::LShr, w, shift);
+            let left = self.s.m.i32(32 - 8 * width);
+            let x = self.s.m.bin(c, Bin::Shl, x, left);
+            let mut x = self
+                .s
+                .m
+                .bin(c, if signed { Bin::AShr } else { Bin::LShr }, x, left);
+            if rest.contains("d16") {
+                // Into one half of the VGPR (extended to 16 bits); the
+                // other half keeps its bits.
+                let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
+                    Some(Ok(o)) => o,
+                    _ => self.s.m.i32(0),
+                };
+                let low = self.s.m.i32(0xFFFF);
+                let h = self.s.m.bin(c, Bin::And, x, low);
+                let (h, keep) = if hi {
+                    let sixteen = self.s.m.i32(16);
+                    (self.s.m.bin(c, Bin::Shl, h, sixteen), low)
+                } else {
+                    (h, self.s.m.i32(0xFFFF_0000))
+                };
+                let o = self.s.m.bin(c, Bin::And, old, keep);
+                x = self.s.m.bin(c, Bin::Or, o, h);
+            }
+            self.write(inst, Reg::V(reg), x, guard);
+            return Ok(());
+        }
+        let data = data.as_ref().ok_or("scratch store data")?;
+        let vals = self.vgprs(inst, data, width.div_ceil(4) as u8)?;
+        for (k, mut x) in vals.into_iter().enumerate() {
+            let (p, inside) = element(self, k as u32);
+            let g = match guard {
+                Some(g) => self.s.m.bin(self.cur, Bin::And, g, inside),
+                None => inside,
+            };
+            let at = self.begin_guarded(Some(g));
+            let c = self.cur;
+            if width < 4 {
+                // The byte or short within its dword (`_d16_hi`: from the
+                // high half of the VGPR).
+                if hi {
+                    let sixteen = self.s.m.i32(16);
+                    x = self.s.m.bin(c, Bin::LShr, x, sixteen);
+                }
+                let mask = self.s.m.i32((1 << (8 * width)) - 1);
+                let mask = self.s.m.bin(c, Bin::Shl, mask, shift);
+                let x = self.s.m.bin(c, Bin::Shl, x, shift);
+                let x = self.s.m.bin(c, Bin::And, x, mask);
+                let ones = self.s.m.i32(u32::MAX);
+                let keep = self.s.m.bin(c, Bin::Xor, mask, ones);
+                let old = self.s.m.load(c, p);
+                let old = self.s.m.bin(c, Bin::And, old, keep);
+                let new = self.s.m.bin(c, Bin::Or, old, x);
+                self.s.m.store(c, p, new);
+            } else {
+                self.s.m.store(c, p, x);
+            }
+            self.end_guarded(at, &[]);
+        }
+        Ok(())
     }
 
     /// A global memory load (`global_load_*`): from the program's constant
@@ -2205,7 +2549,8 @@ impl<'a> Lower<'a> {
             MaskData::None => false,
         };
         let effect = matches!(inst.fields, Fields::Exp { .. })
-            || matches!(inst.fields, Fields::Flat { .. }) && !name.starts_with("global_load_")
+            || matches!(inst.fields, Fields::Flat { .. })
+                && !(name.starts_with("global_load_") || name.starts_with("scratch_load_"))
             || name.contains("store")
             || name.contains("atomic")
             || name == "s_barrier"
@@ -2237,6 +2582,8 @@ impl<'a> Lower<'a> {
             Fields::Exp { .. } => self.export(b, i),
             Fields::Ds { .. } => self.ds(inst, b, i),
             Fields::Flat { .. } if name.starts_with("global_") => self.flat(inst, b, i),
+            Fields::Flat { .. } if name.starts_with("scratch_") => self.scratch(inst, b, i),
+            // Generic addresses: private, shared or global memory by aperture.
             Fields::Flat { .. } => Err("flat memory"),
         };
         match r {
@@ -6628,6 +6975,57 @@ mod tests {
         for words in [add, sub] {
             lowers(&words).unwrap();
         }
+    }
+
+    #[test]
+    fn private_memory_is_as_large_as_its_addresses_reach() {
+        let bytes = |words: &[u32]| {
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            super::scratch_bytes(&ir::build(&code, false, 256).unwrap())
+        };
+        let store = [
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0xDC70_401C, // scratch_store_dword v1, v2, off offset:28
+            0x007D_0201,
+        ];
+        let indexed = [
+            0x3606_0087, // v_and_b32 v3, 7, v0
+            0x3406_0682, // v_lshlrev_b32 v3, 2, v3
+            0xDC30_4000, // scratch_load_dword v4, v3, off
+            0x047D_0003,
+        ];
+        assert_eq!(bytes(&[&store[..], &indexed, &[S_ENDPGM]].concat()), 32);
+        // An address the code does not bound (the thread id).
+        let free = [0xDC30_4000, 0x047D_0000]; // scratch_load_dword v4, v0, off
+        assert_eq!(
+            bytes(&[&store[..], &free, &[S_ENDPGM]].concat()),
+            super::SCRATCH_CAP
+        );
+        let far = [
+            0x7E02_02FF, // v_mov_b32 v1, 0x100000
+            0x0010_0000,
+            0xDC70_4000, // scratch_store_dword v1, v2, off
+            0x007D_0201,
+            S_ENDPGM,
+        ];
+        assert_eq!(bytes(&far), super::SCRATCH_MAX);
+    }
+
+    #[test]
+    fn generic_flat_memory_is_refused() {
+        // flat_store_dword v[0:1], v2: the address may be private, shared
+        // or global memory.
+        let e = lowers(&[0xDC70_0000, 0x007D_0200, S_ENDPGM]).unwrap_err();
+        assert!(
+            matches!(
+                e,
+                crate::ShaderError::Unsupported {
+                    what: "flat memory",
+                    ..
+                }
+            ),
+            "{e}"
+        );
     }
 
     #[test]

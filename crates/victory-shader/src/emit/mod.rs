@@ -83,6 +83,8 @@ mod diff_tests;
 pub mod host;
 mod lower;
 mod sampler;
+#[cfg(all(test, windows))]
+mod scratch_tests;
 mod shader;
 #[cfg(windows)]
 pub mod validator;

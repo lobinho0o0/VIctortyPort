@@ -385,6 +385,9 @@ impl Instruction {
                 let glc = bit(w0, 16);
                 let n = data_dwords(name);
                 let (load, atomic) = (name.contains("_load_"), name.contains("_atomic_"));
+                // Scratch with `saddr` 0x7F (EXEC_HI) has neither address
+                // register, only the offset (LLVM's GFX10 "ST" mode).
+                let st = self.encoding == Encoding::Scratch && saddr == 0x7F;
                 let addr = match self.encoding {
                     Encoding::Flat => Some(vector(w1 & 0xFF, 2)),
                     Encoding::Global => Some(vector(w1 & 0xFF, 1 + u8::from(saddr == NULL))),
@@ -400,7 +403,7 @@ impl Instruction {
                     dst: (load || atomic && glc).then(|| vector(w1 >> 24, ret)),
                     addr,
                     data: (!load).then(|| vector(w1 >> 8 & 0xFF, n)),
-                    saddr: (self.encoding != Encoding::Flat)
+                    saddr: (self.encoding != Encoding::Flat && !st)
                         .then(|| scalar(saddr, 1 + u8::from(self.encoding == Encoding::Global))),
                     offset: match self.encoding {
                         Encoding::Flat => (w0 & 0x7FF) as i16,

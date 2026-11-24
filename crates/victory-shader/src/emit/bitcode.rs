@@ -143,6 +143,8 @@ enum Op {
     AtomicRmw(Rmw, V, V),
     /// Pointer, expected, new; returns `{i32, i1}`.
     CmpXchg(V, V, V),
+    /// One of the type, per lane (a local array); the size constant.
+    Alloca(Ty, V),
 }
 
 #[derive(Debug, Clone)]
@@ -447,6 +449,12 @@ impl Module {
         self.extract(block, r, 0)
     }
 
+    /// Memory of type `ty` private to each lane (`alloca`), for the entry block.
+    pub fn alloca(&mut self, block: usize, ty: Ty) -> V {
+        let (ptr, one) = (self.ptr(ty), self.i32(1));
+        self.push(block, ptr, Op::Alloca(ty, one))
+    }
+
     pub fn set_phi(&mut self, phi: V, incoming: Vec<(V, usize)>) {
         let V::Inst(i) = phi else { panic!() };
         self.insts[i as usize].op = Op::Phi(incoming);
@@ -626,6 +634,7 @@ impl Module {
                 Op::Call(_, args) => args.clone(),
                 Op::Phi(inc) => inc.iter().map(|x| x.0).collect(),
                 Op::Gep(_, p, idx) => std::iter::once(*p).chain(idx.iter().copied()).collect(),
+                Op::Alloca(..) => vec![],
             }
         };
         for b in &self.blocks {
@@ -837,6 +846,12 @@ impl Module {
                     }
                     Op::CmpXchg(p, c, n) => {
                         w.record(46, &[rel(*p), rel(*c), rel(*n), 0, 6, 1, 6, 0]);
+                    }
+                    // [type, size type, size (absolute id), alignment 4
+                    // (log2 + 1) | explicit type (bit 6)].
+                    Op::Alloca(ty, n) => {
+                        let (nt, n) = (self.type_of(*n).0, abs(*n));
+                        w.record(19, &[u64::from(ty.0), u64::from(nt), u64::from(n), 3 | 64]);
                     }
                 }
                 if !self.is_void(inst.ty) {
