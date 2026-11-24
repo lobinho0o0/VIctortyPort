@@ -170,6 +170,12 @@ impl State {
         self.pipeline = pipeline as usize;
     }
 
+    /// Takes the dynamic descriptor slots held by this recording, so a
+    /// pending host list can keep them alive until its submission finishes.
+    pub(crate) fn take_dynamic(&mut self) -> Vec<(usize, u32, u32)> {
+        std::mem::take(&mut self.dynamic)
+    }
+
     /// The title's topology; console-only ones become host lists (see
     /// [`crate::primitive`]).
     pub(crate) fn set_topology(&mut self, list: &HostList, topology: u32) {

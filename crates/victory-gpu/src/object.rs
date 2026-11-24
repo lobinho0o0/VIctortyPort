@@ -61,6 +61,34 @@ impl Object {
 
 pub(crate) type This = *const Object;
 
+/// A reference to one of our objects held by work that runs later (on a
+/// queue held back by a wait), given back on drop.
+pub(crate) struct Held(This);
+
+// SAFETY: our objects are made for use from many threads (counts atomic,
+// state locked).
+unsafe impl Send for Held {}
+
+impl Held {
+    pub(crate) fn new(this: This) -> Held {
+        add_ref(this);
+        Held(this)
+    }
+
+    pub(crate) fn get(&self) -> This {
+        self.0
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        // SAFETY: one of our objects; slot 2 of its table is `Release`.
+        let release: extern "system" fn(This) -> u32 =
+            unsafe { std::mem::transmute(*(*self.0).functions.add(2)) };
+        release(self.0);
+    }
+}
+
 #[repr(transparent)]
 pub(crate) struct Table<const N: usize>(pub [*const (); N]);
 // SAFETY: function addresses only.
