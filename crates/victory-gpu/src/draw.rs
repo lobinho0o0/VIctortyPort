@@ -77,6 +77,8 @@ pub(crate) struct State {
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
+    /// Last bindless view heap prepared on this list: `(heap, revision, copy_epoch)`.
+    bindless_prepared: Option<(usize, (u64, u64, u64), u64)>,
 }
 
 impl Drop for State {
@@ -195,6 +197,7 @@ impl State {
 
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
         self.heaps = [0; 2];
+        self.bindless_prepared = None;
         for &h in heaps {
             if !h.is_null() {
                 let samplers = crate::descriptor::heap(h).samplers();
@@ -443,6 +446,19 @@ impl State {
             // The title may release the pipeline before it submits the list.
             list.keep(&p.pso);
             list.keep(&p.root);
+        }
+        if p.stages.iter().any(|s| s.translated().resource_heap)
+            && self.heaps[0] != 0
+            && let Some(host_heap) = crate::descriptor::heap(self.heaps[0] as This).host_arc()
+        {
+            let epoch = list.title_write_epoch();
+            let key = (self.heaps[0], host_heap.revision(), epoch);
+            if self.bindless_prepared != Some(key) {
+                host_heap.prepare_bindless_record(list);
+                self.bindless_prepared = Some((self.heaps[0], host_heap.revision(), epoch));
+            }
+            let writes = p.stages.iter().any(|s| s.translated().writes_memory);
+            list.defer_bindless(&host_heap, writes);
         }
         for stage in &p.stages {
             let t = stage.translated();

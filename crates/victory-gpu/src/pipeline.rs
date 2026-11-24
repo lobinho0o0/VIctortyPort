@@ -98,6 +98,11 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
 pub(crate) struct Translated {
     pub(crate) host: victory_shader::emit::HostShader,
     pub(crate) used: Vec<victory_shader::UsedResource>,
+    /// Whether the shader indexes `ResourceDescriptorHeap[]` directly.
+    pub(crate) resource_heap: bool,
+    /// Whether the shader may write memory (buffer, image, or global stores
+    /// and atomics); `true` when its code is not known.
+    pub(crate) writes_memory: bool,
 }
 
 #[cfg(windows)]
@@ -131,24 +136,72 @@ impl Shader {
 
 #[cfg(windows)]
 fn translate(container: &[u8]) -> Result<Translated, String> {
-    use victory_shader::{Container, FourCC, HwStage};
+    use victory_shader::{Container, FourCC, HwStage, RootType};
     let host = crate::shader_cache::host_shader(container)?;
-    let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let used = match c.part(FourCC::DXIL) {
-        Some(part) => victory_shader::native_programs(part.data)
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .find(|p| {
-                matches!(
-                    p.stage,
-                    HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
-                )
+    let dxil_heap = Container::parse(&host.dxil).is_ok_and(|c| {
+        c.part(FourCC::SFI0)
+            .and_then(|p| p.data.get(..8))
+            .is_some_and(|b| {
+                let flags = u64::from_le_bytes(b.try_into().unwrap_or_default());
+                flags & (1 << 32) != 0
             })
-            .map(|p| p.used)
-            .unwrap_or_default(),
+    });
+    let c = Container::parse(container).map_err(|e| e.to_string())?;
+    let programs = match c.part(FourCC::DXIL) {
+        Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
-    Ok(Translated { host, used })
+    let writes_memory = programs.is_empty() || programs.iter().any(writes_memory);
+    let (used, native_heap) = programs
+        .into_iter()
+        .find(|p| {
+            matches!(
+                p.stage,
+                HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
+            )
+        })
+        .map(|p| {
+            let rh = p.layout.iter().any(|rp| rp.root == RootType::ResourceHeap)
+                || p.used.iter().any(|u| u.root == RootType::ResourceHeap);
+            (p.used, rh)
+        })
+        .unwrap_or_default();
+    Ok(Translated {
+        host,
+        used,
+        resource_heap: dxil_heap || native_heap,
+        writes_memory,
+    })
+}
+
+/// Whether a native program may write memory: it has a buffer, image,
+/// flat, or global store or atomic, or code that is not all known (an
+/// instruction outside our table, an indirect jump, or code that does not
+/// decode).
+#[cfg(windows)]
+fn writes_memory(program: &victory_shader::NativeProgram) -> bool {
+    use victory_shader::gfx10::{Encoding, decode};
+    let Ok(code) = decode(&program.code) else {
+        return true;
+    };
+    code.iter().any(|i| {
+        let name = i.name();
+        match i.encoding {
+            Encoding::Mubuf
+            | Encoding::Mtbuf
+            | Encoding::Mimg
+            | Encoding::Flat
+            | Encoding::Global => name.is_none_or(stores),
+            Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
+            _ => false,
+        }
+    })
+}
+
+/// Whether a memory instruction (by name) writes memory.
+#[cfg(windows)]
+fn stores(name: &str) -> bool {
+    name.contains("store") || name.contains("atomic")
 }
 
 #[repr(C)]

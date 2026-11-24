@@ -1137,22 +1137,36 @@ pub(crate) extern "system" fn create_at_address(
 }
 
 /// Textures the title placed in its own memory and views without a
-/// resource object (device 0x230, Grand Theft Auto VI's streamed and
-/// interface textures), by address and description: a resource at that
-/// address, made the first time a draw reads one.
-/// shortcut: never released (one host texture per distinct address and
-/// description viewed); release them when the title unmaps or reuses the
-/// memory once streaming grows VRAM use.
+/// resource object (device 0x230, streamed and interface textures), by
+/// address and description: a resource at that address and where its
+/// footprint ends, made the first time a draw reads one and evicted when
+/// [`crate::watch::title_memory_remapped`] unmaps or remaps the range.
 #[cfg(windows)]
-static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
+type PlacedTextureMap = std::collections::BTreeMap<(u64, [u32; 14]), (usize, u64)>;
+
+#[cfg(windows)]
+static PLACED_TEXTURES: std::sync::Mutex<PlacedTextureMap> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Incremented whenever [`evict_placed_textures`] removes an entry so
+/// bindless heaps re-check placed texture slots.
+#[cfg(windows)]
+static PLACED_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(windows)]
+pub(crate) fn placed_epoch() -> u64 {
+    PLACED_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+}
 
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]
 pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
+    if address == 0 {
+        return None;
+    }
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(&r) = map.get(&(address, *desc)) {
+    if let Some(&(r, _)) = map.get(&(address, *desc)) {
         return Some(r as This);
     }
     // SAFETY: 56 bytes in the description's layout.
@@ -1160,6 +1174,8 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     if d.dimension == BUFFER {
         return None;
     }
+    let size = footprint(&d).map_or(1, |info| info.size.max(1));
+    let end = address.saturating_add(size);
     let mut out = std::ptr::null();
     let made = create_at_address(
         std::ptr::null(),
@@ -1173,8 +1189,46 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     if made != S_OK {
         return None;
     }
-    map.insert((address, *desc), out as usize);
-    resource(out).host.is_some().then_some(out)
+    if resource(out).host.is_none() {
+        drop(map);
+        resource_release(out);
+        return None;
+    }
+    map.insert((address, *desc), (out as usize, end));
+    Some(out)
+}
+
+/// Releases placed textures whose backing range overlaps `[start, end)`.
+#[cfg(windows)]
+pub(crate) fn evict_placed_textures(start: u64, end: u64) {
+    if start >= end {
+        return;
+    }
+    let mut evicted = Vec::new();
+    {
+        let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        map.retain(|&(addr, _), &mut (res, tex_end)| {
+            let overlaps = addr < end && tex_end > start;
+            if overlaps {
+                evicted.push(res);
+            }
+            !overlaps
+        });
+    }
+    if !evicted.is_empty() {
+        PLACED_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+        for res in evicted {
+            resource_release(res as This);
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn has_placed_texture(address: u64, desc: &[u32; 14]) -> bool {
+    PLACED_TEXTURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&(address, *desc))
 }
 
 pub(crate) extern "system" fn create_placed(

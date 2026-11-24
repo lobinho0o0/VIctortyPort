@@ -214,18 +214,27 @@ pub fn writing(at: usize, len: usize) {
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
-/// shows is new and read-write, so it is no longer guarded.
+/// shows is new and read-write, so it is no longer guarded, and any placed
+/// textures backed by that range are evicted.
 pub fn title_memory_remapped(at: usize, len: usize) {
-    let mut g = guards();
-    let blocks: Vec<usize> = g
-        .protected
-        .range(at / BLOCK..(at + len).div_ceil(BLOCK))
-        .copied()
-        .collect();
-    for block in blocks {
-        g.protected.remove(&block);
-        g.clean.remove(&block);
+    if len == 0 {
+        return;
     }
+    let end = at.saturating_add(len);
+    {
+        let mut g = guards();
+        let blocks: Vec<usize> = g
+            .protected
+            .range(at / BLOCK..end.div_ceil(BLOCK))
+            .copied()
+            .collect();
+        for block in blocks {
+            g.protected.remove(&block);
+            g.clean.remove(&block);
+        }
+    }
+    crate::resource::evict_placed_textures(at as u64, end as u64);
+    crate::descriptor::host::bindless_viewed_changed();
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
