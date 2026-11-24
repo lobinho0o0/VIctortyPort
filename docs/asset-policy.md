@@ -40,6 +40,12 @@ Outside the repository, configured in `victory.toml`: `game_dir` (the
 user's dump), `test_titles`, and `cache_dir` for everything derived
 (default `%LOCALAPPDATA%\victory\cache`).
 
+Under Wine/Proton, vkd3d-proton and DXVK write shader caches
+(`vkd3d-proton.cache`, `*.dxvk-cache`) into the current directory. They are
+derived data and `.gitignore` covers them; to keep them out of the checkout
+entirely, run from elsewhere or point `VKD3D_SHADER_CACHE_PATH` /
+`DXVK_STATE_CACHE_PATH` at a directory outside the repository.
+
 ## Enforcement
 
 1. `.gitignore` keeps common data types out of `git status`.
