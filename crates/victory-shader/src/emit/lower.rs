@@ -5792,6 +5792,17 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let name = inst.name();
+        if name == "buffer_gl0_inv" || name == "buffer_gl1_inv" {
+            // Console cache coherence: gl0 writes back and invalidates the
+            // per-CU shader L0, gl1 invalidates GL1, so one wavefront's
+            // writes become visible to others. D3D12 already guarantees UAV
+            // coherence across wavefronts and dispatches, DXIL has no
+            // equivalent instruction, and this project's host-visible
+            // writeback comes from command-stream GpuWrite ranges rather
+            // than shader cache hints. Ordering is kept by the surrounding
+            // s_waitcnt/s_barrier, which the translator does lower.
+            return Ok(());
+        }
         if *lds || *tfe {
             return Err("a buffer access to LDS or with tfe");
         }
@@ -6596,6 +6607,14 @@ mod tests {
             mesh_stride: 0,
         })
         .map(|_| ())
+    }
+
+    #[test]
+    fn buffer_cache_invalidations_lower_as_no_ops() {
+        // MUBUF opcode 0x071/0x072 with no data operand: the title asks the
+        // host to invalidate its cached view of a buffer.
+        assert!(lowers(&[0xE1C4_0000, 0, S_ENDPGM]).is_ok(), "buffer_gl0_inv");
+        assert!(lowers(&[0xE1C8_0000, 0, S_ENDPGM]).is_ok(), "buffer_gl1_inv");
     }
 
     #[test]
