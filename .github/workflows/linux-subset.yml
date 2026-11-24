@@ -1,0 +1,103 @@
+# Interim Linux CI for the crates that already build without Windows.
+# Superseded once full-workspace Linux CI lands; fold or delete then.
+#
+# Every step here passes on plain Linux with no Windows SDK, no cross target
+# and no game data. The PR that added this lists the same commands for local use.
+name: linux-subset
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-subset-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # Crates (plus xtask) that build, test and are clippy-clean on Linux today.
+  LINUX_CRATES: >-
+    -p victory-core -p victory-pe -p victory-formats -p victory-pipeline
+    -p victory-game -p victory-loader -p xtask
+  # Crates that are clippy-clean for the Windows target today.
+  WINDOWS_CLIPPY_CRATES: >-
+    -p victory-core -p victory-pe -p victory-formats -p victory-pipeline
+    -p victory-game -p victory-loader -p victory-shader
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # rustup is preinstalled; this installs the toolchain pinned in
+      # rust-toolchain.toml (with clippy and rustfmt).
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Asset policy
+        run: cargo xtask policy
+
+      - name: clippy (all targets)
+        run: cargo clippy --all-targets --locked $LINUX_CRATES -- -D warnings
+
+      # victory-shader's test module has a helper only the Windows tests use, so
+      # its test target is dead code on Linux; lint the library and run tests.
+      - name: clippy (victory-shader lib)
+        run: cargo clippy --lib --locked -p victory-shader -- -D warnings
+
+      # The skipped tests parse the test executable itself as a PE image, which
+      # is an ELF on Linux. They still run on Windows. Once the workspace's
+      # Linux gates land they are cfg(windows) and these --skip flags are no-ops.
+      - name: cargo test
+        run: >
+          cargo test --locked $LINUX_CRATES -p victory-shader
+          -- --exact
+          --skip image::tests::parses_own_test_binary
+          --skip image::tests::rva_to_file_offset_maps_entry_point
+          --skip image::tests::rva_to_file_offset_rejects_offsets_past_4_gib
+          --skip image::tests::rejects_iat_outside_image
+          --skip prepare::tests::patches_own_test_binary
+          --skip prepare::tests::keeps_iat_slots_when_import_size_excludes_the_terminator
+          --skip prepare::tests::file_name_is_stable_per_build
+
+  # Type-checks the Windows build from Linux: no MSVC, no linking, nothing runs.
+  # Catches compile errors in cfg(windows) code (most of victory-gpu,
+  # victory-hle and apps/victory, and the Windows-only tests) that the job
+  # above never compiles.
+  windows-target-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # blake3's build script compiles C/assembly with MSVC tools for this
+      # target. Its build script reads this variable to select the pure-Rust
+      # implementation; nothing is linked here, so the choice has no effect.
+      CARGO_FEATURE_PURE: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml already lists the x86_64-pc-windows-msvc target.
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-target
+
+      - name: cargo check (workspace, all targets)
+        run: cargo check --locked --workspace --all-targets --target x86_64-pc-windows-msvc
+
+      # victory-gpu, victory-hle and apps/victory are not clippy-clean for
+      # Windows yet; add them here once they are.
+      - name: clippy (Windows target, clean crates)
+        run: >
+          cargo clippy --locked --all-targets --target x86_64-pc-windows-msvc
+          $WINDOWS_CLIPPY_CRATES -- -D warnings

@@ -19,9 +19,48 @@ fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
 }
 
-/// Builds the fixture into its own target dir (the outer cargo holds the
-/// lock on the main one while tests run).
-fn build_probe() -> PathBuf {
+/// Set to a prebuilt `hle_probe.dll` to load it instead of building one.
+const PREBUILT_PROBE: &str = "VICTORY_HLE_PROBE_DLL";
+
+/// Whether we run under Wine (its ntdll exports `wine_get_version`).
+fn under_wine() -> bool {
+    // SAFETY: NUL-terminated strings; ntdll is always loaded.
+    unsafe {
+        let ntdll = LoadLibraryA(c"ntdll.dll".as_ptr().cast());
+        !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+    }
+}
+
+/// The fixture to load, or `None` when it cannot be had here.
+///
+/// Normally it is built into its own target dir (the outer cargo holds the
+/// lock on the main one while tests run). Under Wine, as when a test exe
+/// cross-built on Linux is run by Wine or Proton, the `cargo` that built the
+/// test is a host program the guest cannot run, so the test is skipped
+/// unless the fixture was built beforehand, e.g. with
+/// `cargo xwin build --manifest-path tests/fixtures/hle-probe/Cargo.toml
+/// --target x86_64-pc-windows-msvc` and its path in `VICTORY_HLE_PROBE_DLL`.
+fn probe_dll() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os(PREBUILT_PROBE).filter(|p| !p.is_empty()) {
+        let path = PathBuf::from(path);
+        // Under Wine a bare Unix path (`/home/...`) resolves against the
+        // current drive and silently misses; fail with the fix instead of a
+        // bare "not found" from the read below.
+        assert!(
+            path.is_file(),
+            "{PREBUILT_PROBE}={} is not a file; under Wine use its Windows \
+             path, e.g. Z:/home/you/VIctory/target/fixtures/.../hle_probe.dll",
+            path.display()
+        );
+        return Some(path);
+    }
+    if under_wine() {
+        eprintln!(
+            "skipping: under Wine the host cargo cannot build hle-probe; \
+             set {PREBUILT_PROBE} to a prebuilt hle_probe.dll to run this test"
+        );
+        return None;
+    }
     let root = workspace_root();
     let manifest = root.join("tests/fixtures/hle-probe/Cargo.toml");
     let target = root.join("target/fixtures");
@@ -33,7 +72,7 @@ fn build_probe() -> PathBuf {
         .status()
         .expect("running cargo");
     assert!(status.success(), "building hle-probe failed");
-    target.join("debug").join("hle_probe.dll")
+    Some(target.join("debug").join("hle_probe.dll"))
 }
 
 extern "system" fn fake_xgameruntime_initialize() -> i32 {
@@ -97,7 +136,9 @@ fn host(dll: &str, name: &str) -> Option<usize> {
 
 #[test]
 fn loads_binds_and_calls_probe() {
-    let dll = build_probe();
+    let Some(dll) = probe_dll() else {
+        return;
+    };
     let original = std::fs::read(&dll).unwrap();
     let prepared = prepare(&original).unwrap();
 
