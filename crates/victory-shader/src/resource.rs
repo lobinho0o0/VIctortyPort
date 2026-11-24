@@ -95,7 +95,7 @@ pub struct Resources {
 /// `stage`, to the root parameters in `layout`. Fails on the first one it
 /// cannot trace.
 pub fn track(p: &Program, layout: &[RootParam], stage: HwStage) -> Result<Resources, ShaderError> {
-    let t = Tracer::new(p, layout, stage)?;
+    let mut t = Tracer::new(p, layout, stage)?;
     let mut out = Resources {
         params: p
             .inputs
@@ -166,6 +166,7 @@ enum Term {
 
 /// A 32-bit sum: optional root parameter (as its first dword), constant,
 /// optional computed term.
+#[derive(Clone, Copy)]
 struct Sum {
     base: Option<Value>,
     offset: u32,
@@ -183,6 +184,8 @@ struct Tracer<'a> {
     /// Register per input value.
     inputs: Vec<Option<Reg>>,
     origin: Vec<Term>,
+    /// Address sums already traced, indexed by SSA value.
+    sums: Vec<Option<Sum>>,
 }
 
 const MAX_ROUNDS: usize = 64;
@@ -226,6 +229,7 @@ impl<'a> Tracer<'a> {
             phis,
             inputs,
             origin: Vec::new(),
+            sums: Vec::new(),
         };
         t.origin = t.propagate_copies(n)?;
         Ok(t)
@@ -337,7 +341,7 @@ impl<'a> Tracer<'a> {
         ))
     }
 
-    fn sum(&self, t: Term) -> Sum {
+    fn sum(&mut self, t: Term) -> Sum {
         let v = match t {
             Term::Const(c) => {
                 return Sum {
@@ -348,12 +352,16 @@ impl<'a> Tracer<'a> {
             }
             Term::Value(v) => v,
         };
+        let index = v.0 as usize;
+        if let Some(&Some(sum)) = self.sums.get(index) {
+            return sum;
+        }
         let dynamic = Sum {
             base: None,
             offset: 0,
             dynamic: Some(v),
         };
-        if let Some(reg) = self.inputs[v.0 as usize] {
+        if let Some(reg) = self.inputs[index] {
             return match self.param_of(reg) {
                 Some((_, 0)) => Sum {
                     base: Some(v),
@@ -378,14 +386,23 @@ impl<'a> Tracer<'a> {
             return dynamic;
         };
         let (x, y) = (self.sum(a), self.sum(b));
-        if x.base.is_some() && y.base.is_some() || x.dynamic.is_some() && y.dynamic.is_some() {
-            return dynamic;
+        let sum =
+            if x.base.is_some() && y.base.is_some() || x.dynamic.is_some() && y.dynamic.is_some() {
+                dynamic
+            } else {
+                Sum {
+                    base: x.base.or(y.base),
+                    offset: x.offset.wrapping_add(y.offset),
+                    dynamic: x.dynamic.or(y.dynamic),
+                }
+            };
+        // The operands' origins are settled before tracing starts. Every
+        // use of this value can reuse its sum, including an opaque result.
+        if index >= self.sums.len() {
+            self.sums.resize(index + 1, None);
         }
-        Sum {
-            base: x.base.or(y.base),
-            offset: x.offset.wrapping_add(y.offset),
-            dynamic: x.dynamic.or(y.dynamic),
-        }
+        self.sums[index] = Some(sum);
+        sum
     }
 
     /// The `s_getpc_b64` writing `lo` as its low dword.
@@ -448,7 +465,7 @@ impl<'a> Tracer<'a> {
     /// A global memory address: an SGPR pair plus a VGPR offset, or a VGPR
     /// pair.
     fn flat_address(
-        &self,
+        &mut self,
         inst: &Inst,
         addr: Option<&Operand>,
         saddr: Option<&Operand>,
@@ -492,7 +509,7 @@ impl<'a> Tracer<'a> {
 
     /// The address `lo` and `hi` hold, plus `extra` (an instruction's
     /// immediate and offset register).
-    fn address(&self, lo: Term, hi: Term, extra: Sum) -> Result<Address, &'static str> {
+    fn address(&mut self, lo: Term, hi: Term, extra: Sum) -> Result<Address, &'static str> {
         let s = self.sum(lo);
         if s.dynamic.is_some() && extra.dynamic.is_some() {
             return Err("an address with two computed terms");
@@ -603,7 +620,7 @@ impl<'a> Tracer<'a> {
     }
 
     fn smem_address(
-        &self,
+        &mut self,
         inst: &Inst,
         base: &Operand,
         offset: i32,
@@ -627,7 +644,7 @@ impl<'a> Tracer<'a> {
         self.address(lo, hi, extra)
     }
 
-    fn descriptor(&self, inst: &Inst, op: &Operand) -> Result<Source, &'static str> {
+    fn descriptor(&mut self, inst: &Inst, op: &Operand) -> Result<Source, &'static str> {
         let Operand::Scalar { code, dwords } = *op else {
             return Err("a descriptor not in SGPRs");
         };
@@ -640,7 +657,7 @@ impl<'a> Tracer<'a> {
 
     /// The source of a descriptor's words; `joins` are the phi blocks
     /// being resolved.
-    fn classify(&self, words: &[Term], joins: &mut Vec<usize>) -> Result<Source, &'static str> {
+    fn classify(&mut self, words: &[Term], joins: &mut Vec<usize>) -> Result<Source, &'static str> {
         if let Some(source) = self.phi(words, joins)? {
             return Ok(source);
         }
@@ -692,15 +709,19 @@ impl<'a> Tracer<'a> {
 
     /// Words that phis of one block join, traced per predecessor (words
     /// defined before the join hold on every edge).
-    fn phi(&self, words: &[Term], joins: &mut Vec<usize>) -> Result<Option<Source>, &'static str> {
-        let phi_of = |w: &Term| match *w {
-            Term::Value(v) => self.phis[v.0 as usize],
-            Term::Const(_) => None,
-        };
-        let Some((block, _)) = words.iter().find_map(phi_of) else {
+    fn phi(
+        &mut self,
+        words: &[Term],
+        joins: &mut Vec<usize>,
+    ) -> Result<Option<Source>, &'static str> {
+        let Some((block, _)) = words.iter().find_map(|&w| self.phi_site(w)) else {
             return Ok(None);
         };
-        if words.iter().filter_map(phi_of).any(|(b, _)| b != block) {
+        if words
+            .iter()
+            .filter_map(|&w| self.phi_site(w))
+            .any(|(b, _)| b != block)
+        {
             return Err("a descriptor joined in several blocks");
         }
         if joins.contains(&block) {
@@ -716,9 +737,9 @@ impl<'a> Tracer<'a> {
             .map(|j| {
                 let edge: Vec<Term> = words
                     .iter()
-                    .map(|w| match phi_of(w) {
+                    .map(|&w| match self.phi_site(w) {
                         Some((_, i)) => self.origin(phis[i].args[j]),
-                        None => *w,
+                        None => w,
                     })
                     .collect();
                 self.classify(&edge, joins)
@@ -726,6 +747,13 @@ impl<'a> Tracer<'a> {
             .collect::<Result<_, _>>();
         joins.pop();
         Ok(Some(Source::Phi { block, args: args? }))
+    }
+
+    fn phi_site(&self, word: Term) -> Option<Site> {
+        match word {
+            Term::Value(v) => self.phis[v.0 as usize],
+            Term::Const(_) => None,
+        }
     }
 
     /// `v` as some other dword with constant bits set.
