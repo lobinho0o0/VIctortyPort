@@ -81,10 +81,17 @@ extern "system" fn launch_new_game(
         .unwrap_or_default();
     let ours: Vec<_> = std::env::args_os().skip(1).collect();
     let command = relaunch_args(ours, current.as_os_str(), &exe, &args);
+    #[cfg(windows)]
     super::lifecycle::end_title(
         "XLaunchNewGame",
         Box::new(move || super::lifecycle::relaunch(command)),
     );
+    #[cfg(not(windows))]
+    {
+        tracing::error!(?command, "XLaunchNewGame: relaunch is Windows-only");
+        std::process::exit(1);
+    }
+    #[cfg(windows)]
     loop {
         std::thread::park();
     }

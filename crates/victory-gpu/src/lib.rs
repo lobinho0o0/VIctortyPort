@@ -15,6 +15,12 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
+// Off Windows there is no host D3D12: the host halves of the objects are
+// gated out, so the console-side state they would read (formats, barriers,
+// descriptor records, counters) is unused there. It builds so the workspace
+// links and the layout tests run; Windows still warns on real dead code.
+#![cfg_attr(not(windows), allow(dead_code, unused_variables, unused_mut))]
+
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;

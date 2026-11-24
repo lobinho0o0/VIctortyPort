@@ -212,7 +212,7 @@ static FUNCTIONS: Table<24> = {
     Table(f)
 };
 
-#[cfg(test)]
+#[cfg(all(test, windows))] // every test here calls into host D3D12 / Win32
 mod tests {
     use super::*;
     use crate::object::{S_OK, slot};

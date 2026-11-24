@@ -45,6 +45,7 @@ pub mod xuser;
 use crate::HleModule;
 
 pub(crate) fn all() -> Vec<HleModule> {
+    #[cfg_attr(not(windows), allow(unused_mut))] // only Windows pushes more
     let mut all = vec![
         kernel::module(),
         xgameruntime::module(),
