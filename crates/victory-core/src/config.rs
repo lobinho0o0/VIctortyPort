@@ -22,8 +22,29 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// Other titles used to exercise platform-level code.
     pub test_titles: Vec<PathBuf>,
+    /// Graphics pacing and presentation settings.
+    pub graphics: GraphicsConfig,
     /// The config file that was read, if any.
     pub source: Option<PathBuf>,
+}
+
+/// Graphics pacing and presentation settings (`[graphics]` in `victory.toml`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphicsConfig {
+    /// Target frame-rate cap in FPS (`None` = title default, `Some(0)` =
+    /// uncapped, `Some(n)` = cap at `n` FPS).
+    pub fps_limit: Option<u32>,
+    /// Allow DXGI flip-model tearing when supported by the display and adapter.
+    pub allow_tearing: bool,
+}
+
+impl Default for GraphicsConfig {
+    fn default() -> Self {
+        Self {
+            fps_limit: None,
+            allow_tearing: true,
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -31,6 +52,8 @@ pub struct Config {
 struct FileConfig {
     #[serde(default)]
     paths: FilePaths,
+    #[serde(default)]
+    graphics: FileGraphics,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -41,6 +64,13 @@ struct FilePaths {
     data_dir: Option<PathBuf>,
     #[serde(default)]
     test_titles: Vec<PathBuf>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileGraphics {
+    fps_limit: Option<u32>,
+    allow_tearing: Option<bool>,
 }
 
 impl Config {
@@ -70,11 +100,11 @@ impl Config {
             }
             None => (None, FileConfig::default()),
         };
-        Self::resolve(parsed.paths, source, |k| std::env::var_os(k))
+        Self::resolve(parsed, source, |k| std::env::var_os(k))
     }
 
     fn resolve(
-        file: FilePaths,
+        file: FileConfig,
         source: Option<PathBuf>,
         env: impl Fn(&str) -> Option<std::ffi::OsString>,
     ) -> Result<Self> {
@@ -83,19 +113,50 @@ impl Config {
             Some(v) => std::env::split_paths(&v)
                 .filter(|p| !p.as_os_str().is_empty())
                 .collect(),
-            None => file.test_titles,
+            None => file.paths.test_titles,
         };
         let cache_dir = env_path("VICTORY_CACHE_DIR")
-            .or(file.cache_dir)
+            .or(file.paths.cache_dir)
             .map_or_else(|| default_dir("cache"), Ok)?;
         let data_dir = env_path("VICTORY_DATA_DIR")
-            .or(file.data_dir)
+            .or(file.paths.data_dir)
             .map_or_else(|| default_dir("data"), Ok)?;
+        let fps_limit = match env("VICTORY_FPS_LIMIT")
+            .map(|v| v.to_string_lossy().trim().to_owned())
+            .filter(|s| !s.is_empty())
+        {
+            Some(raw) => {
+                let parsed = raw.parse::<u32>().with_context(|| {
+                    format!(
+                        "parsing VICTORY_FPS_LIMIT={raw:?} as a non-negative integer FPS limit (0 = uncapped)"
+                    )
+                })?;
+                Some(parsed)
+            }
+            None => file.graphics.fps_limit,
+        };
+        let allow_tearing = match env("VICTORY_ALLOW_TEARING")
+            .map(|v| v.to_string_lossy().trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+        {
+            Some(raw) => match raw.as_str() {
+                "1" | "true" | "yes" | "on" => true,
+                "0" | "false" | "no" | "off" => false,
+                _ => anyhow::bail!(
+                    "parsing VICTORY_ALLOW_TEARING={raw:?} as a boolean (expected true/false or 1/0)"
+                ),
+            },
+            None => file.graphics.allow_tearing.unwrap_or(true),
+        };
         Ok(Config {
-            game_dir: env_path("VICTORY_GAME_DIR").or(file.game_dir),
+            game_dir: env_path("VICTORY_GAME_DIR").or(file.paths.game_dir),
             cache_dir,
             data_dir,
             test_titles,
+            graphics: GraphicsConfig {
+                fps_limit,
+                allow_tearing,
+            },
             source,
         })
     }
@@ -143,9 +204,12 @@ mod tests {
 
     #[test]
     fn environment_overrides_file() {
-        let file = FilePaths {
-            game_dir: Some("from-file".into()),
-            cache_dir: Some("cache-from-file".into()),
+        let file = FileConfig {
+            paths: FilePaths {
+                game_dir: Some("from-file".into()),
+                cache_dir: Some("cache-from-file".into()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let env = |k: &str| (k == "VICTORY_GAME_DIR").then(|| OsString::from("from-env"));
@@ -156,13 +220,85 @@ mod tests {
 
     #[test]
     fn empty_env_values_are_ignored() {
-        let file = FilePaths {
-            game_dir: Some("from-file".into()),
-            ..Default::default()
+        let file = FileConfig {
+            paths: FilePaths {
+                game_dir: Some("from-file".into()),
+                ..Default::default()
+            },
+            graphics: FileGraphics {
+                fps_limit: Some(120),
+                allow_tearing: Some(false),
+            },
         };
-        let env = |k: &str| (k == "VICTORY_GAME_DIR").then(OsString::new);
+        let env = |k: &str| {
+            matches!(
+                k,
+                "VICTORY_GAME_DIR" | "VICTORY_FPS_LIMIT" | "VICTORY_ALLOW_TEARING"
+            )
+            .then(OsString::new)
+        };
         let cfg = Config::resolve(file, None, env).unwrap();
         assert_eq!(cfg.game_dir.unwrap(), PathBuf::from("from-file"));
+        assert_eq!(cfg.graphics.fps_limit, Some(120));
+        assert!(!cfg.graphics.allow_tearing);
+    }
+
+    #[test]
+    fn graphics_section_is_optional_and_configurable() {
+        let legacy: FileConfig = toml::from_str(
+            r#"
+[paths]
+game_dir = 'C:\games\test'
+"#,
+        )
+        .unwrap();
+        let cfg = Config::resolve(legacy, None, |_| None).unwrap();
+        assert_eq!(cfg.graphics.fps_limit, None);
+        assert!(cfg.graphics.allow_tearing);
+
+        let with_graphics: FileConfig = toml::from_str(
+            r#"
+[paths]
+game_dir = 'C:\games\test'
+
+[graphics]
+fps_limit = 0
+allow_tearing = false
+"#,
+        )
+        .unwrap();
+        let cfg = Config::resolve(with_graphics, None, |_| None).unwrap();
+        assert_eq!(cfg.graphics.fps_limit, Some(0));
+        assert!(!cfg.graphics.allow_tearing);
+    }
+
+    #[test]
+    fn fps_limit_and_tearing_env_override_file() {
+        let file = FileConfig {
+            graphics: FileGraphics {
+                fps_limit: Some(60),
+                allow_tearing: Some(false),
+            },
+            ..Default::default()
+        };
+        let env = |k: &str| match k {
+            "VICTORY_FPS_LIMIT" => Some(OsString::from("144")),
+            "VICTORY_ALLOW_TEARING" => Some(OsString::from("true")),
+            _ => None,
+        };
+        let cfg = Config::resolve(file, None, env).unwrap();
+        assert_eq!(cfg.graphics.fps_limit, Some(144));
+        assert!(cfg.graphics.allow_tearing);
+
+        let bad_fps = Config::resolve(FileConfig::default(), None, |k| {
+            (k == "VICTORY_FPS_LIMIT").then(|| OsString::from("fast"))
+        });
+        assert!(bad_fps.is_err());
+
+        let bad_tearing = Config::resolve(FileConfig::default(), None, |k| {
+            (k == "VICTORY_ALLOW_TEARING").then(|| OsString::from("maybe"))
+        });
+        assert!(bad_tearing.is_err());
     }
 
     #[test]
