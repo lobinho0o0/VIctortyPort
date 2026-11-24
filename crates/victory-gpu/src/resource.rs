@@ -891,6 +891,26 @@ pub(crate) fn buffer_bytes(this: This) -> Option<(*mut u8, u64)> {
     (r.desc.dimension == BUFFER).then(|| (r.data(), r.desc.width))
 }
 
+/// Keeps a buffer's title backing alive while a recorded copy names it.
+#[cfg(windows)]
+#[derive(PartialEq, Eq)]
+pub(crate) struct BufferLease(usize);
+
+#[cfg(windows)]
+impl BufferLease {
+    pub(crate) fn new(buffer: This) -> Self {
+        object::add_ref(buffer);
+        Self(buffer as usize)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for BufferLease {
+    fn drop(&mut self) {
+        resource_release(self.0 as This);
+    }
+}
+
 impl Resource {
     fn data(&self) -> *mut u8 {
         match self.backing {

@@ -142,42 +142,25 @@ impl Shadow {
         list.defer_gpu_write(self, address as usize, len as usize);
     }
 
-    /// At submission, after the range's refresh: a submitted list's shaders
-    /// write this range. Its bytes are kept to tell later what the GPU wrote:
-    /// one snapshot per copy and submission, grown to cover every range the
-    /// submission declares (the world declares overlapping views of its
-    /// 174 MB heap dozens of times), in reused memory (fresh snapshots cost
-    /// ~2.3 million page faults per world frame).
-    pub(crate) fn writing(&self, address: usize, len: usize) {
+    /// Prevent later CPU refreshes from replacing a pending GPU write.
+    pub(crate) fn queue_write(&self, address: usize, len: usize) {
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push((address, address + len));
+    }
+
+    /// Once all CPU refreshes are done, keep the bytes the GPU starts with.
+    /// Refreshes can still fill gaps between earlier queued writes.
+    pub(crate) fn snapshot(&self, address: usize, len: usize) {
         let (from, to) = self.inside(address, len);
         // SAFETY: inside the mapping.
-        let host = |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
+        let host = unsafe { std::slice::from_raw_parts(self.data.add(from), to - from) };
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-        let (start, end) = match &*before {
-            Some((at, bytes)) => ((*at).min(from), (at + bytes.len()).max(to)),
-            None => (from, to),
-        };
-        if let Some((at, bytes)) = &*before
-            && (*at, at + bytes.len()) == (start, end)
-        {
-            return;
-        }
-        // Parts newly covered from the copy, the rest as it was taken.
-        let mut grown = pooled(end - start);
-        match before.take() {
-            Some((at, bytes)) => {
-                grown.extend_from_slice(host(start, at));
-                grown.extend_from_slice(&bytes);
-                grown.extend_from_slice(host(at + bytes.len(), end));
-                give_back(bytes);
-            }
-            None => grown.extend_from_slice(host(start, end)),
-        }
-        *before = Some((start, grown));
+        debug_assert!(before.is_none());
+        let mut bytes = pooled(to - from);
+        bytes.extend_from_slice(host);
+        *before = Some((from, bytes));
     }
 
     /// After the submission ran: copies the bytes its shaders wrote back
@@ -188,7 +171,7 @@ impl Shadow {
     /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
     /// written.
     pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
-        let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
@@ -247,16 +230,19 @@ impl Shadow {
                 }
             }
         }
-        // Every submitted step that declared the range is done with it (one
-        // submission runs at a time), and the snapshot with the last range.
-        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        pending.retain(|&r| r != (address, address + len));
-        if pending.is_empty()
-            && let Some((_, bytes)) = snapshot.take()
-        {
+        written
+    }
+
+    /// After every range from this shadow has been copied back.
+    pub(crate) fn finish_writes(&self) {
+        let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        if let Some((_, bytes)) = snapshot.take() {
             give_back(bytes);
         }
-        written
     }
 
     /// At submission: copies what changed of `[address, address + len)`

@@ -64,8 +64,14 @@ pub(crate) struct State {
     /// Bound render target and depth resources, for their host states.
     targets: Vec<usize>,
     depth: usize,
+    rtvs: Vec<(ID3D12Resource, Option<D3D12_RENDER_TARGET_VIEW_DESC>)>,
+    dsv: Option<(ID3D12Resource, Option<D3D12_DEPTH_STENCIL_VIEW_DESC>)>,
     /// The title's primitive topology (the host's may differ).
     topology: u32,
+    viewports: Vec<D3D12_VIEWPORT>,
+    scissors: Vec<RECT>,
+    blend_factor: Option<[f32; 4]>,
+    stencil_ref: u32,
     /// What the host list has: pipeline, root signature, heaps.
     host_pipeline: usize,
     /// Graphics, compute.
@@ -170,6 +176,54 @@ impl State {
         self.pipeline = pipeline as usize;
     }
 
+    pub(crate) fn resume(&mut self, list: &HostList) {
+        self.host_pipeline = 0;
+        self.host_roots = [0; 2];
+        self.host_heaps = [0; 2];
+        // A previous copy can change data read into a table's CBV scratch.
+        self.fresh_tables.clear();
+        if self.topology != 0 {
+            self.set_topology(list, self.topology);
+        }
+        if !self.viewports.is_empty() {
+            viewports(list, &self.viewports);
+        }
+        if !self.scissors.is_empty() {
+            scissors(list, &self.scissors);
+        }
+        if let Some(factor) = &self.blend_factor {
+            blend_factor(list, Some(factor));
+        }
+        if self.stencil_ref != 0 {
+            stencil_ref(list, self.stencil_ref);
+        }
+        if !self.rtvs.is_empty() || self.dsv.is_some() {
+            self.bind_targets(list);
+        }
+    }
+
+    pub(crate) fn set_viewports(&mut self, list: &HostList, values: &[D3D12_VIEWPORT]) {
+        self.viewports.clear();
+        self.viewports.extend_from_slice(values);
+        viewports(list, values);
+    }
+
+    pub(crate) fn set_scissors(&mut self, list: &HostList, values: &[RECT]) {
+        self.scissors.clear();
+        self.scissors.extend_from_slice(values);
+        scissors(list, values);
+    }
+
+    pub(crate) fn set_blend_factor(&mut self, list: &HostList, factor: Option<&[f32; 4]>) {
+        self.blend_factor = factor.copied();
+        blend_factor(list, factor);
+    }
+
+    pub(crate) fn set_stencil_ref(&mut self, list: &HostList, reference: u32) {
+        self.stencil_ref = reference;
+        stencil_ref(list, reference);
+    }
+
     /// The title's topology; console-only ones become host lists (see
     /// [`crate::primitive`]).
     pub(crate) fn set_topology(&mut self, list: &HostList, topology: u32) {
@@ -248,11 +302,8 @@ impl State {
 
     /// Render targets and depth, set on the host list at once.
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
-        let Some(host) = crate::host::host() else {
-            return;
-        };
         self.targets.clear();
-        let mut rtvs = Vec::new();
+        self.rtvs.clear();
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
@@ -267,15 +318,34 @@ impl State {
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            rtvs.push(host.rtv(texture, record.desc().as_ref()));
+            self.rtvs.push((texture.clone(), record.desc()));
         }
         self.depth = 0;
-        let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
+        self.dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
             let texture = crate::resource::host_resource(record.resource)?;
             self.depth = record.resource as usize;
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            Some(host.dsv(texture, record.depth_desc().as_ref()))
+            Some((texture.clone(), record.depth_desc()))
+        });
+        self.bind_targets(list);
+    }
+
+    fn bind_targets(&self, list: &HostList) {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let rtvs: Vec<_> = self
+            .rtvs
+            .iter()
+            .map(|(texture, desc)| {
+                list.keep(texture);
+                host.rtv(texture, desc.as_ref())
+            })
+            .collect();
+        let dsv = self.dsv.as_ref().map(|(texture, desc)| {
+            list.keep(texture);
+            host.dsv(texture, desc.as_ref())
         });
         // SAFETY: an open list; the views were just made.
         unsafe {
@@ -868,7 +938,7 @@ impl State {
             };
             let (from, to, stride) = (from as usize, to as usize, stride as usize);
             let n = rects as usize;
-            list.defer_host(move || {
+            list.defer_host((from, n * 3 * stride), move || {
                 // SAFETY: the vertices lie in a title buffer (checked when
                 // recorded) and the scratch memory is the list's.
                 let (src, dst) = unsafe {
